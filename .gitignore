@@ -1,0 +1,34 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.so
+.env
+.env.local
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Logs and local data
+logs/
+*.log
+*.sqlite
+*.db
+data/scans/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Node (if you use npm in Frontend)
+node_modules/
+npm-debug.log*
+
+# Optional: keep small logs or exclude large ones
+# !logs/.gitkeep
