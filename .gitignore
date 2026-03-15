@@ -1,14 +1,10 @@
-# ----- Version control: ignore these so Git tracks only source code -----
-
-# Environment and secrets (never commit)
+# Environment and secrets
 .env
 .env.local
-.env.*.local
-*.pem
+*.env
 
 # Python
 venv/
-.venv/
 __pycache__/
 *.py[cod]
 *$py.class
@@ -19,28 +15,20 @@ __pycache__/
 dist/
 build/
 
-# Database and scan output (generated at runtime)
+# Data and logs (local/generated)
 data/irs.db
-data/irs.db-journal
 data/scans/
-
-# Logs (generated at runtime)
 logs/
 *.log
 
-# Node / Frontend (if you add npm later)
-node_modules/
-Frontend/node_modules/
-npm-debug.log*
-
-# IDE and OS
+# IDE / OS
 .idea/
 .vscode/
-*.swp
-*.swo
 .DS_Store
 Thumbs.db
 
-# Optional: keep structure but ignore large/generated files
-# data/
+# Optional: keep data/ and logs/ structure but ignore contents
+# data/*
 # !data/.gitkeep
+# logs/*
+# !logs/.gitkeep
