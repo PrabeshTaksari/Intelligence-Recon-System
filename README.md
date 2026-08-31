@@ -21,23 +21,22 @@ Architecture
  4. Recon/scanning tools: Shelled out to as external CLI binaries (ProjectDiscovery suite and others)
  5. Reporting: WeasyPrint (HTML → PDF)
 
+```text
 app/
-├── ai/            # AI decision engine, prompts, report generation
-├── api/           # FastAPI routers (scans, reports, tools, schedules, settings, health)
-├── core/          # Config, database, logging, websocket updates
-├── models/        # SQLAlchemy models
-├── schemas/       # Pydantic schemas
-├── services/      # Scan orchestration, intelligence summary, report building, email alerts
-├── tools/         # Wrappers for each recon/scanning tool
-└── utils/
-Frontend/          # Static single-page UI
-data/              # SQLite DB, scan artifacts, alert settings (generated at runtime)
-docs/              # Project documentation (pending upload — see note below)
-install.sh         # Sets up venv and installs Python dependencies
-install-tools.sh   # Installs external recon/scanning tools (Go, pip, gem)
-requirements.txt   # Python dependencies
-resume.cfg         # Project/resume config
-
+├── ai/                    # AI decision engine, prompts, report generation
+├── api/                   # FastAPI routers (scans, reports, tools, schedules, settings, health)
+├── core/                  # Config, database, logging, websocket updates
+├── models/                # SQLAlchemy models
+├── schemas/               # Pydantic schemas
+├── services/              # Scan orchestration, intelligence summary, report building, email alerts
+├── tools/                 # Wrappers for each recon/scanning tool
+└── utils/                 # Utilities
+Frontend/                  # Static single-page UI data/ # SQLite DB, scan artifacts, alert settings
+docs/                      # Project documentation (pending upload — see note below)
+install.sh                 # Sets up venv and installs Python dependencies
+install-tools.sh           # Installs external recon/scanning tools (Go, pip, gem)
+requirements.txt           # Python dependencies
+resume.cfg                 # Project/resume config
 
 Supported Tools
 IRS drives the following tools (must be installed separately and available on PATH):
