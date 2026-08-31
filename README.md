@@ -66,7 +66,7 @@ Tested on Debian/Ubuntu-based Linux. You'll need:
  5. A Google Gemini API key (optional — the platform can run with AI features disabled)
 
 If any of these aren't already on your system, install them first:
-# Update package lists
+Update package lists
 sudo apt update
 
 # Python, pip, venv, git
