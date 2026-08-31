@@ -1,0 +1,824 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Intelligence Recon System (IRS)</title>
+  <link rel="icon" href="/static/favicon.svg?v=3" type="image/svg+xml" />
+  <link rel="shortcut icon" href="/static/favicon.svg?v=3" type="image/svg+xml" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Prevent caching -->
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <link rel="stylesheet" href="/static/styles.css?v=1.2.6" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script>
+    (function() {
+      var allowed = ["dark-soc", "light-minimal"];
+      var t = localStorage.getItem("irs_theme");
+      var theme = (t && allowed.indexOf(t) !== -1) ? t : "dark-soc";
+      document.documentElement.setAttribute("data-theme", theme);
+    })();
+  </script>
+</head>
+<body class="theme-dark-soc app-loading">
+<script>
+  (function() {
+    var allowed = ["dark-soc", "light-minimal"];
+    var t = localStorage.getItem("irs_theme");
+    if (t && allowed.indexOf(t) !== -1) {
+      document.body.classList.remove("theme-dark-soc", "theme-light-minimal");
+      document.body.classList.add("theme-" + t);
+    }
+  })();
+</script>
+<!-- Icon sprite (hidden) -->
+<svg style="position:absolute;width:0;height:0" aria-hidden="true">
+  <defs>
+    <symbol id="icon-dashboard" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></symbol>
+    <symbol id="icon-reports" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></symbol>
+    <symbol id="icon-targets" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></symbol>
+    <symbol id="icon-tools" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></symbol>
+    <symbol id="icon-settings" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+    <symbol id="icon-trend" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
+    <symbol id="icon-live" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></symbol>
+    <symbol id="icon-scan" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></symbol>
+    <symbol id="icon-severity" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.21 15.89A10 10 0 1 1 8 2.83"/><path d="M22 12A10 10 0 0 0 12 2v10z"/></symbol>
+    <symbol id="icon-launch" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/><circle cx="12" cy="12" r="10"/></symbol>
+    <symbol id="icon-schedule" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+    <symbol id="icon-refresh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></symbol>
+  </defs>
+</svg>
+<div class="app-shell">
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <nav class="sidebar-nav">
+      <button class="nav-item active" data-section="dashboard">
+        <svg class="nav-icon" aria-hidden="true"><use href="#icon-dashboard"/></svg>
+        <span class="nav-dot"></span> Dashboard
+      </button>
+      <button class="nav-item" data-section="saved-reports">
+        <svg class="nav-icon" aria-hidden="true"><use href="#icon-reports"/></svg>
+        <span class="nav-dot"></span> Saved Reports
+      </button>
+      <button class="nav-item" data-section="scanned-targets">
+        <svg class="nav-icon" aria-hidden="true"><use href="#icon-targets"/></svg>
+        <span class="nav-dot"></span> Scanned Targets
+      </button>
+      <button class="nav-item" data-section="scheduled-scans">
+        <svg class="nav-icon" aria-hidden="true"><use href="#icon-schedule"/></svg>
+        <span class="nav-dot"></span> Scheduled Scans
+      </button>
+      <button class="nav-item" data-section="tools-owasp">
+        <svg class="nav-icon" aria-hidden="true"><use href="#icon-tools"/></svg>
+        <span class="nav-dot"></span> Tools & OWASP
+      </button>
+      <button class="nav-item" data-section="settings">
+        <svg class="nav-icon" aria-hidden="true"><use href="#icon-settings"/></svg>
+        <span class="nav-dot"></span> Settings
+      </button>
+    </nav>
+
+  </aside>
+
+  <!-- Main -->
+  <div class="main">
+    <!-- Top bar -->
+    <header class="topbar">
+      <div class="topbar-left">
+        <img src="/static/logo.png" alt="IRS" class="topbar-logo topbar-logo-dark" width="44" height="44" />
+        <img src="/static/favicon.svg" alt="IRS" class="topbar-logo topbar-logo-light" width="44" height="44" />
+        <span class="topbar-title">INTELLIGENCE RECON SYSTEM</span>
+        <span class="live-badge">LIVE INSTANCE</span>
+      </div>
+      <div class="topbar-right">
+        <div class="topbar-search" id="quickSearchWrap">
+          <input id="quickSearchInput" type="text" placeholder="Quick target search..." autocomplete="off" aria-autocomplete="list" aria-controls="quickSearchDropdown" aria-expanded="false" />
+          <div id="quickSearchDropdown" class="quick-search-dropdown hidden" role="listbox" aria-label="Matching targets"></div>
+        </div>
+      </div>
+    </header>
+    <main class="content">
+      <!-- DASHBOARD -->
+      <section id="dashboard" class="content-section visible">
+        <!-- Top summary cards -->
+        <div class="grid grid-4">
+          <div class="stat-card stat-card-clickable" id="statCardUniqueTargets" role="button" tabindex="0" aria-label="Show unique targets">
+            <div class="stat-label">Unique Targets</div>
+            <div class="stat-value" id="statUniqueTargets">0</div>
+            <div class="stat-foot">Last 30 days</div>
+          </div>
+          <div class="stat-card stat-critical stat-card-clickable" id="statCardCriticalTargets" role="button" tabindex="0" aria-label="Show targets with criticals">
+            <div class="stat-label">Targets with Criticals</div>
+            <div class="stat-value" id="statCriticalTargets">0</div>
+            <div class="stat-foot">Open critical findings</div>
+          </div>
+          <div class="stat-card stat-clean stat-card-clickable" id="statCardCleanAssets" role="button" tabindex="0" aria-label="Show clean assets">
+            <div class="stat-label">Clean Assets</div>
+            <div class="stat-value" id="statCleanAssets">0</div>
+            <div class="stat-foot">No risk findings</div>
+          </div>
+          <div class="stat-card stat-schedule" id="statCardScheduledScans" role="button" tabindex="0" aria-label="Go to Scheduled Scans">
+            <div class="stat-label">Scheduled Scans</div>
+            <div class="stat-value" id="statScheduledScans">0</div>
+            <div class="stat-foot">
+              On: <span id="statScheduledScansOn">0</span> · Off: <span id="statScheduledScansOff">0</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Main dashboard grid - 2x2 layout -->
+        <div class="grid grid-2 mt-lg">
+          <!-- Row 1: Security Trend Analytics -->
+          <div class="card dashboard-chart-card">
+            <div class="card-header">
+              <span class="card-title"><svg class="card-icon" aria-hidden="true"><use href="#icon-trend"/></svg> Security Trend Analytics</span>
+              <div class="trend-date-range-wrap">
+                <label class="trend-date-label">
+                  <span class="trend-date-label-text">Start</span>
+                  <input type="date" id="trendStartDate" class="trend-date-input" aria-label="Start date">
+                </label>
+                <label class="trend-date-label">
+                  <span class="trend-date-label-text">End</span>
+                  <input type="date" id="trendEndDate" class="trend-date-input" aria-label="End date">
+                </label>
+                <button type="button" id="trendApplyBtn" class="trend-apply-btn">Apply</button>
+              </div>
+            </div>
+            <div class="card-body card-body-chart" style="overflow-x: auto; position: relative;">
+              <div style="min-width: 600px; position: relative;">
+                <canvas id="trendChart"></canvas>
+              </div>
+            </div>
+          </div>
+
+          <!-- Row 1: Launch Recon Scan -->
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title"><svg class="card-icon" aria-hidden="true"><use href="#icon-launch"/></svg> Launch Recon Scan</span>
+            </div>
+            <div class="card-body">
+              <form id="launchForm" class="launch-form">
+                <label class="field">
+                  <span class="field-label">Target Host</span>
+                  <input type="text" id="targetInput" placeholder="domain.com or IP address" required>
+                </label>
+
+                <label class="field">
+                  <span class="field-label">OWASP Category</span>
+                  <select id="owaspSelect" required>
+                    <option value="">Select category...</option>
+                    <option value="A01:2021">A01:2021 – Broken Access Control</option>
+                    <option value="A02:2021">A02:2021 – Cryptographic Failures</option>
+                    <option value="A03:2021">A03:2021 – Injection</option>
+                    <option value="A04:2021">A04:2021 – Insecure Design</option>
+                    <option value="A05:2021">A05:2021 – Security Misconfiguration</option>
+                    <option value="A06:2021">A06:2021 – Vulnerable and Outdated Components</option>
+                    <option value="A07:2021">A07:2021 – Identification and Authentication Failures</option>
+                    <option value="A08:2021">A08:2021 – Software and Data Integrity Failures</option>
+                    <option value="A09:2021">A09:2021 – Security Logging and Monitoring Failures</option>
+                    <option value="A10:2021">A10:2021 – Server-Side Request Forgery</option>
+                  </select>
+                </label>
+
+                <div class="field">
+                  <span class="field-label">Recon Toolchain Selection</span>
+                  <div id="toolCheckboxGrid" class="tool-grid"></div>
+                </div>
+
+                <div class="launch-actions">
+                  <button type="submit" id="runScanBtn" class="btn-primary"><svg class="btn-icon" aria-hidden="true"><use href="#icon-scan"/></svg> Run Full Scan</button>
+                  <button type="button" id="clearLaunchBtn" class="btn-ghost">Clear</button>
+                </div>
+
+                <p class="field-help" id="launchHelpText">
+                  Selected tools and OWASP category will be validated by AI before execution.
+                </p>
+              </form>
+            </div>
+          </div>
+
+          <!-- Row 2: Severity Distribution -->
+          <div class="card dashboard-chart-card">
+            <div class="card-header">
+              <span class="card-title"><svg class="card-icon" aria-hidden="true"><use href="#icon-severity"/></svg> Severity Distribution</span>
+              <div class="trend-header-right">
+                <span class="card-subtitle" id="severitySubtitle" aria-hidden="true">Critical · High · Medium · Low · Info — cumulative for all scans</span>
+              </div>
+            </div>
+            <div class="card-body card-body-chart chart-stack">
+              <div class="severity-chart-wrap">
+                <canvas id="severityChart"></canvas>
+              </div>
+              <div style="display: flex; flex-direction: column; justify-content: center; min-height: 300px;">
+                <ul class="severity-legend">
+                  <li><span class="dot sev-critical"></span><span>Critical</span> <span id="sevCriticalCount">0</span></li>
+                  <li><span class="dot sev-high"></span><span>High</span> <span id="sevHighCount">0</span></li>
+                  <li><span class="dot sev-medium"></span><span>Medium</span> <span id="sevMediumCount">0</span></li>
+                  <li><span class="dot sev-low"></span><span>Low</span> <span id="sevLowCount">0</span></li>
+                  <li><span class="dot sev-info"></span><span>Info</span> <span id="sevInfoCount">0</span></li>
+                </ul>
+                <div class="severity-total-row">
+                  <span>Total:</span> <span id="totalFindingsCount" class="severity-total-count">0</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Row 2: Live Status Tracker -->
+          <div class="card live-status-card">
+            <div class="card-header">
+              <span class="card-title"><svg class="card-icon" aria-hidden="true"><use href="#icon-live"/></svg> Live Status Tracker</span>
+            </div>
+            <div class="card-body live-status-body">
+              <ul id="liveStatusList" class="status-list"></ul>
+            </div>
+          </div>
+        </div>
+
+        <!-- Scanned Target Summary -->
+        <div class="card mt-lg">
+          <div class="card-header">
+            <span class="card-title"><svg class="card-icon" aria-hidden="true"><use href="#icon-targets"/></svg> SCANNED TARGET SUMMARY</span>
+            <div class="scan-summary-controls">
+              <select id="scanSummaryFilter" class="trend-range-select">
+                <option value="">Select a scan</option>
+              </select>
+              <button id="refreshScanSummary" class="btn-ghost btn-small btn-icon-only" type="button" aria-label="Refresh summary"><svg class="btn-icon" aria-hidden="true" width="16" height="16"><use href="#icon-refresh"/></svg></button>
+              <span id="scanSummaryStatus" class="badge-status badge-running hidden">LIVE</span>
+            </div>
+          </div>
+          <div class="card-body">
+            <div id="scanSummaryContainer" class="scan-summary-container">
+              <div class="scan-summary-placeholder">
+                <div class="summary-placeholder-icon">🔍</div>
+                <div class="summary-placeholder-text">Run a scan to see real-time intelligence summary</div>
+          
+              </div>
+            </div>
+            <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 15px;">
+              <button id="generatePdfReport" class="btn-ghost">Generate PDF</button>
+              <button id="saveScanSummary" class="btn-primary">Save Summary</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- SAVED REPORTS -->
+      <section id="saved-reports" class="content-section">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title"><svg class="card-icon" aria-hidden="true"><use href="#icon-reports"/></svg> Security Reports Registry</span>
+          </div>
+          <div class="card-body">
+            <div class="table-filters">
+              <input type="text" id="reportsFilterTarget" placeholder="Filter by target..." />
+              <select id="reportsFilterOwasp" title="OWASP Category">
+                <option value="">OWASP Category: All</option>
+                <option value="A01:2021">A01:2021</option>
+                <option value="A02:2021">A02:2021</option>
+                <option value="A03:2021">A03:2021</option>
+                <option value="A04:2021">A04:2021</option>
+                <option value="A05:2021">A05:2021</option>
+                <option value="A06:2021">A06:2021</option>
+                <option value="A07:2021">A07:2021</option>
+                <option value="A08:2021">A08:2021</option>
+                <option value="A09:2021">A09:2021</option>
+                <option value="A10:2021">A10:2021</option>
+              </select>
+              <select id="reportsFilterStatus" title="Status">
+                <option value="">Status: All</option>
+                <option value="running">Running</option>
+                <option value="completed">Completed</option>
+                <option value="completed_with_errors">Completed with Errors</option>
+                <option value="failed">Failed</option>
+              </select>
+            </div>
+
+            <div class="table-wrapper">
+              <table class="data-table">
+                <thead>
+                <tr>
+                  <th>Scan ID</th>
+                  <th>Target Host</th>
+                  <th>Category</th>
+                  <th>Severity</th>
+                  <th>Findings</th>
+                  <th>Status</th>
+                  <th class="th-details-col">Actions</th>
+                </tr>
+                </thead>
+                <tbody id="reportsTableBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- SCANNED TARGETS -->
+      <section id="scanned-targets" class="content-section">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title"><svg class="card-icon" aria-hidden="true"><use href="#icon-targets"/></svg> Scanned Targets</span>
+            <button type="button" id="deleteSelectedTargetsBtn" class="btn-danger btn-sm" title="Delete selected targets" style="display: none;">Delete</button>
+          </div>
+          <div class="card-body">
+            <div class="table-wrapper">
+              <table class="data-table">
+                <thead>
+                <tr>
+                  <th class="th-select"><input type="checkbox" id="targetsSelectAll" aria-label="Select all targets" title="Select all"/></th>
+                  <th>Target Name</th>
+                  <th>Top Severity</th>
+                  <th>Scan Runs</th>
+                  <th>Discovery Date</th>
+                  <th class="th-details-col">Details</th>
+                </tr>
+                </thead>
+                <tbody id="targetsTableBody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- SCHEDULED SCANS -->
+      <section id="scheduled-scans" class="content-section scheduled-scans-section">
+        <div class="schedule-section-header">
+          <div class="schedule-section-header-inner">
+            <span class="schedule-section-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></span>
+            <div>
+              <h2 class="schedule-section-title">Scheduled Scans</h2>
+              <p class="schedule-section-desc">Scans run automatically while the server is on. Add a schedule and view results below.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="schedule-add-panel">
+          <h3 class="schedule-panel-title"><span class="schedule-panel-title-icon">+</span> Add schedule</h3>
+          <form id="scheduledScanForm" class="schedule-form">
+            <div class="schedule-form-grid">
+              <label class="schedule-field">
+                <span class="schedule-field-label">Target Host</span>
+                <input type="text" id="scheduleTarget" placeholder="e.g. example.com" required />
+              </label>
+              <label class="schedule-field">
+                <span class="schedule-field-label">OWASP Category</span>
+                <select id="scheduleOwasp" required></select>
+              </label>
+              <label class="schedule-field schedule-field-full">
+                <span class="schedule-field-label">Tools</span>
+                <div id="scheduleToolGrid" class="tool-grid schedule-tool-grid"></div>
+              </label>
+              <div class="schedule-field schedule-field-full schedule-when-row">
+                <span class="schedule-field-label">When to run</span>
+                <div class="schedule-when-inner">
+                  <div class="schedule-repeat-pills" role="group" aria-label="Repeat type">
+                    <button type="button" class="schedule-repeat-pill active" data-repeat="once">One-time</button>
+                    <button type="button" class="schedule-repeat-pill" data-repeat="daily">Daily</button>
+                    <button type="button" class="schedule-repeat-pill" data-repeat="weekly">Weekly</button>
+                    <button type="button" class="schedule-repeat-pill" data-repeat="monthly">Monthly</button>
+                  </div>
+                  <div class="schedule-toggle-wrap">
+                    <span class="schedule-toggle-label">Schedule</span>
+                    <button type="button" id="scheduleToggleBtn" class="schedule-toggle-btn" role="switch" aria-checked="false" title="Set date and time">
+                      <span class="schedule-toggle-track"><span class="schedule-toggle-thumb"></span></span>
+                    </button>
+                  </div>
+                </div>
+                <p id="scheduleNextRunPreview" class="schedule-next-preview hidden">Next run: <span id="scheduleNextRunText"></span></p>
+              </div>
+            </div>
+            <div class="schedule-form-actions">
+              <button type="submit" class="schedule-submit-btn">Add schedule</button>
+            </div>
+          </form>
+        </div>
+
+        <div class="schedule-card schedule-card-plans">
+          <div class="schedule-card-header">
+            <span class="schedule-card-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg></span>
+            <span class="schedule-card-title">Your schedules</span>
+          </div>
+          <div class="schedule-card-body">
+            <div class="table-wrapper schedule-table-wrap">
+              <table class="data-table schedule-table">
+                <thead>
+                  <tr>
+                    <th>Target</th>
+                    <th>Category</th>
+                    <th>Tools</th>
+                    <th>Frequency</th>
+                    <th>Last run</th>
+                    <th>Next run</th>
+                    <th>Status</th>
+                    <th class="th-details-col">Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="scheduledScansTableBody"></tbody>
+              </table>
+            </div>
+            <div id="scheduledScansEmpty" class="schedule-empty hidden">
+              <span class="schedule-empty-icon" aria-hidden="true">📅</span>
+              <p class="schedule-empty-text">No scheduled scans yet.</p>
+              <p class="schedule-empty-hint">Add one using the form above.</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="schedule-card schedule-card-results">
+          <div class="schedule-card-header">
+            <span class="schedule-card-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg></span>
+            <span class="schedule-card-title">Scheduled scan results</span>
+          </div>
+          <div class="schedule-card-body">
+            <div class="table-wrapper schedule-table-wrap">
+              <table class="data-table schedule-table">
+                <thead>
+                  <tr>
+                    <th>Scan ID</th>
+                    <th>Target</th>
+                    <th>Category</th>
+                    <th>Severity</th>
+                    <th>Findings</th>
+                    <th>Status</th>
+                    <th>Created</th>
+                    <th class="th-details-col">Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="scheduledScanResultsBody"></tbody>
+              </table>
+            </div>
+            <div id="scheduledScanResultsEmpty" class="schedule-empty hidden">
+              <span class="schedule-empty-icon" aria-hidden="true">📋</span>
+              <p class="schedule-empty-text">No scheduled scan results yet.</p>
+              <p class="schedule-empty-hint">When a schedule runs, its scan will appear here.</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Date/Time picker modal (Instagram-style scroll) -->
+        <div id="scheduleDateTimeModal" class="schedule-datetime-modal hidden" aria-modal="true" aria-label="Set date and time" role="dialog">
+          <div class="schedule-datetime-backdrop"></div>
+          <div class="schedule-datetime-dialog">
+            <div class="schedule-datetime-header">
+              <h3 id="scheduleDateTimeTitle">Set date & time</h3>
+              <button type="button" class="schedule-datetime-close" aria-label="Close">&times;</button>
+            </div>
+            <div class="schedule-datetime-picker-wrap">
+              <div id="scheduleDateColumn" class="schedule-picker-column schedule-picker-date">
+                <div class="schedule-picker-column-label">Date</div>
+                <div class="schedule-picker-scroll" id="scheduleDateScroll" tabindex="0">
+                  <div class="schedule-picker-list" id="scheduleDateList"></div>
+                </div>
+              </div>
+              <div class="schedule-picker-column schedule-picker-time">
+                <div class="schedule-picker-column-label">Hour</div>
+                <div class="schedule-picker-scroll" id="scheduleTimeScroll" tabindex="0">
+                  <div class="schedule-picker-list" id="scheduleTimeList"></div>
+                </div>
+              </div>
+              <div class="schedule-picker-column schedule-picker-minutes">
+                <div class="schedule-picker-column-label">Min</div>
+                <div class="schedule-picker-scroll" id="scheduleMinuteScroll" tabindex="0">
+                  <div class="schedule-picker-list" id="scheduleMinuteList"></div>
+                </div>
+              </div>
+              <div class="schedule-picker-column schedule-picker-ampm">
+                <div class="schedule-picker-column-label">AM/PM</div>
+                <div class="schedule-picker-scroll" id="scheduleAmpmScroll" tabindex="0">
+                  <div class="schedule-picker-list" id="scheduleAmpmList"></div>
+                </div>
+              </div>
+            </div>
+            <p class="schedule-datetime-preview" id="scheduleDateTimePreview"></p>
+            <div class="schedule-datetime-actions">
+              <button type="button" class="schedule-datetime-cancel btn-ghost">Cancel</button>
+              <button type="button" id="scheduleDateTimeConfirm" class="schedule-datetime-confirm btn-primary">Set schedule</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TOOLS & OWASP -->
+      <section id="tools-owasp" class="content-section">
+        <div class="tabs">
+          <button class="tab active" data-tools-tab="library"><svg class="tab-icon" aria-hidden="true"><use href="#icon-tools"/></svg> Tool Library</button>
+          <button class="tab" data-tools-tab="owasp"><svg class="tab-icon" aria-hidden="true"><use href="#icon-tools"/></svg> OWASP Mapping</button>
+        </div>
+
+        <div id="toolLibraryPanel" class="card mt-md">
+          <div class="card-body">
+            <div id="toolCardGrid" class="tool-card-grid"></div>
+          </div>
+        </div>
+
+        <div id="owaspMappingPanel" class="card mt-md hidden">
+          <div class="card-body">
+            <table class="data-table">
+              <thead>
+              <tr>
+                <th>OWASP Category</th>
+                <th>Description</th>
+                <th>Recommended Tools</th>
+              </tr>
+              </thead>
+              <tbody id="owaspMappingBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- SETTINGS -->
+      <section id="settings" class="content-section">
+        <div class="card">
+          <div class="card-header">
+            <span class="card-title"><svg class="card-icon" aria-hidden="true"><use href="#icon-settings"/></svg> Settings</span>
+          </div>
+          <div class="card-body">
+            <div class="settings-group">
+              <h3 class="settings-title">Theme</h3>
+              <p class="settings-help">Choose your preferred appearance.</p>
+              <div class="theme-grid mt-md" id="themeCardGrid"></div>
+            </div>
+
+            <div class="settings-group mt-md">
+              <h3 class="settings-title">Alert Email</h3>
+              <p class="settings-help">Enable to get Alert Message Email when a scan finishes.</p>
+              <div class="alert-email-settings-row">
+                <label class="alert-email-toggle-wrap">
+                  <input type="checkbox" id="alertEmailEnabled" class="alert-email-checkbox" />
+                  <span class="alert-email-switch-track" aria-hidden="true"><span class="alert-email-switch-thumb"></span></span>
+                  <span class="alert-email-toggle-label">Enable</span>
+                </label>
+                <button type="button" id="alertEmailManageBtn" class="btn-ghost alert-email-manage-btn hidden" aria-label="Manage email addresses">Manage email addresses</button>
+              </div>
+            </div>
+
+            <!-- Hidden for now - restore when needed -->
+            <div id="settingsOther" class="hidden">
+              <div class="settings-group mt-md">
+                <h3 class="settings-title">🔒 API Engine Endpoint</h3>
+                <p class="settings-help">Base URL for IRS scanning engine backend. (Server-managed - not editable)</p>
+                <div class="settings-inline">
+                  <input type="text" id="apiBaseInput" readonly disabled />
+                  <span class="status-pill status-online" id="apiHealthPill"></span>
+                  <span id="apiHealthLabel">LIVE</span>
+                </div>
+                <p class="settings-note">🔐 This setting is controlled by the backend and cannot be changed from the frontend for security reasons.</p>
+              </div>
+
+              <div class="settings-group mt-md">
+                <h3 class="settings-title">Desktop Notifications</h3>
+                <label class="toggle-row">
+                  <input type="checkbox" id="notifyStart" checked />
+                  <span>Notify on scan start</span>
+                </label>
+                <label class="toggle-row">
+                  <input type="checkbox" id="notifyComplete" checked />
+                  <span>Notify on scan complete</span>
+                </label>
+                <label class="toggle-row">
+                  <input type="checkbox" id="notifyCritical" checked />
+                  <span>Notify on critical finding</span>
+                </label>
+              </div>
+
+              <div class="settings-actions mt-md">
+                <button id="saveSettingsBtn" class="btn-primary">Save Changes</button>
+              </div>
+
+              <div class="danger-zone mt-lg">
+                <h3 class="settings-title">Danger Zone</h3>
+                <p class="settings-help">
+                  Resetting the local database will permanently purge all targets and scan logs.
+                </p>
+                <button id="purgeDatabaseBtn" class="btn-danger">Purge Database</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<!-- Alert Email Details Modal -->
+<div id="alertEmailModal" class="modal-backdrop hidden" aria-hidden="true">
+  <div class="modal" style="max-width: 480px;">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title">Email Details</div>
+        <div class="modal-subtitle">Add email addresses to receive alerts when a scan finishes</div>
+      </div>
+      <button type="button" id="alertEmailModalClose" class="modal-close" aria-label="Close">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div id="alertEmailFieldsWrap">
+        <div class="alert-email-row">
+          <input type="email" class="alert-email-input" placeholder="email@example.com" autocomplete="email" />
+          <button type="button" class="alert-email-add-btn" title="Add another email" aria-label="Add another email">+</button>
+        </div>
+      </div>
+      <p id="alertEmailError" class="alert-email-error hidden"></p>
+      <div class="modal-actions mt-md">
+        <button type="button" id="alertEmailCancelBtn" class="btn-ghost">Cancel</button>
+        <button type="button" id="alertEmailSaveBtn" class="btn-primary">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Target Detail Modal -->
+<div id="targetDetailModal" class="modal-backdrop hidden">
+  <div class="modal modal-xl">
+    <div class="modal-header">
+      <div>
+        <div class="modal-title">Target Analysis: <span id="targetDetailTitle">Loading...</span></div>
+        <div class="modal-subtitle" id="targetDetailSubtitle">Aggregated scan data and security analysis</div>
+      </div>
+      <button id="closeTargetDetailModalBtn" class="modal-close">&times;</button>
+    </div>
+    <div class="modal-body target-detail-modal-body">
+      <!-- Target Overview Cards -->
+      <div class="grid grid-4 mb-md">
+        <div class="stat-card">
+          <div class="stat-label">Total Scans</div>
+          <div class="stat-value" id="targetTotalScans">0</div>
+          <div class="stat-foot">Scan runs conducted</div>
+        </div>
+        <div class="stat-card stat-critical">
+          <div class="stat-label">Highest Severity</div>
+          <div class="stat-value" id="targetHighestSeverity">Low</div>
+          <div class="stat-foot">Across all scans</div>
+        </div>
+        <div class="stat-card stat-medium">
+          <div class="stat-label">Total Findings</div>
+          <div class="stat-value" id="targetTotalFindings">0</div>
+          <div class="stat-foot">Across all scans</div>
+        </div>
+        <div class="stat-card stat-clean">
+          <div class="stat-label">Last Scan</div>
+          <div class="stat-value" id="targetLastScan">-</div>
+          <div class="stat-foot">Most recent activity</div>
+        </div>
+      </div>
+
+      <!-- Tabs for different views -->
+      <div class="tabs mb-md">
+        <button class="tab active" data-target-detail-tab="overview">Overview</button>
+        <button class="tab" data-target-detail-tab="findings">Combined Findings</button>
+        <button class="tab" data-target-detail-tab="trends">Trends</button>
+        <button class="tab" data-target-detail-tab="comparison">Comparison</button>
+        <button class="tab" data-target-detail-tab="delete">Delete</button>
+      </div>
+
+      <!-- Tab Content -->
+      <div id="targetDetailTabContent">
+        <!-- Overview Tab -->
+        <div id="overviewTab" class="tab-panel active">
+          <div class="grid grid-2">
+            <div class="card">
+              <div class="card-header">
+                <span class="card-title">Severity Distribution</span>
+              </div>
+              <div class="card-body card-body-chart target-severity-chart-wrap">
+                <canvas id="targetSeverityChart"></canvas>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-header">
+                <span class="card-title">Finding Categories</span>
+              </div>
+              <div class="card-body card-body-chart">
+                <canvas id="targetCategoryChart"></canvas>
+              </div>
+            </div>
+          </div>
+          
+          <div class="card mt-md">
+            <div class="card-header">
+              <span class="card-title">Scan Summary</span>
+            </div>
+            <div class="card-body">
+              <div id="targetScanSummary">Detailed scan summary will appear here...</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Combined Findings Tab -->
+        <div id="findingsTab" class="tab-panel hidden">
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">All Findings</span>
+              <div class="trend-header-right" style="display: flex; gap: 10px; flex-wrap: wrap;">
+                <select id="findingsSeverityFilter" class="trend-range-select">
+                  <option value="all">All Severities</option>
+                  <option value="critical">Critical</option>
+                  <option value="high">High</option>
+                  <option value="medium">Medium</option>
+                  <option value="low">Low</option>
+                  <option value="info">Info</option>
+                </select>
+                <select id="findingsAttackTypeFilter" class="trend-range-select">
+                  <option value="all">All Attack Types</option>
+                </select>
+                <select id="findingsScanIdFilter" class="trend-range-select">
+                  <option value="all">All Scans</option>
+                </select>
+              </div>
+            </div>
+            <div class="card-body">
+              <div class="table-wrapper">
+                <table class="data-table">
+                  <thead>
+                    <tr>
+                      <th>Finding</th>
+                      <th>Severity</th>
+                      <th>Attack</th>
+                      <th>Tool</th>
+                      <th>Scan Date</th>
+                    </tr>
+                  </thead>
+                  <tbody id="targetFindingsTableBody"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Trends Tab -->
+        <div id="trendsTab" class="tab-panel hidden">
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">Severity Trends</span>
+            </div>
+            <div class="card-body card-body-chart target-trend-chart-wrap">
+              <div class="target-trend-chart-inner">
+                <canvas id="targetTrendChart"></canvas>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Comparison Tab -->
+        <div id="comparisonTab" class="tab-panel hidden">
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">Scan Comparison</span>
+              <div class="trend-header-right">
+                <select id="firstScanSelect" class="trend-range-select">
+                  <option value="">Select first scan</option>
+                </select>
+                <select id="secondScanSelect" class="trend-range-select ml-sm">
+                  <option value="">Select second scan</option>
+                </select>
+              </div>
+            </div>
+            <div class="card-body">
+              <div id="scanComparisonResult">
+                Select two scans to compare their findings...
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Delete Tab -->
+        <div id="deleteTab" class="tab-panel hidden">
+          <div class="card">
+            <div class="card-header">
+              <span class="card-title">Delete a scan</span>
+            </div>
+            <div class="card-body">
+              <p class="text-muted mb-md">Select a scan below to permanently delete it and all its data (findings, reports).</p>
+              <div class="table-wrapper">
+                <table class="data-table">
+                  <thead>
+                    <tr>
+                      <th>Scan</th>
+                      <th>Date</th>
+                      <th>Attack type</th>
+                      <th>Findings</th>
+                      <th class="th-details-col">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody id="targetDetailDeleteScanList"></tbody>
+                </table>
+              </div>
+              <p id="targetDetailDeleteEmpty" class="text-muted hidden">No scans to delete.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <!-- Modal Footer with PDF Export -->
+    <div class="modal-footer">
+      <button id="closeTargetDetailModalFooterBtn" class="btn-ghost">Close</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js?v=1.2.4"></script>
+</body>
+</html>

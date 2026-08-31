@@ -1,0 +1,34 @@
+# Environment and secrets
+.env
+.env.local
+*.env
+
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Data and logs (local/generated)
+data/irs.db
+data/scans/
+logs/
+*.log
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Optional: keep data/ and logs/ structure but ignore contents
+# data/*
+# !data/.gitkeep
+# logs/*
+# !logs/.gitkeep
