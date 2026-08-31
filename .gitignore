@@ -32,3 +32,5 @@ Thumbs.db
 # !data/.gitkeep
 # logs/*
 # !logs/.gitkeep
+data/*.db
+data/nuclei_manual_tests/

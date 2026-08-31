@@ -1878,6 +1878,8 @@ class IntelligenceService:
                     "compliance_considerations": [f"OWASP Category: {scan.owasp_category}"] if scan.owasp_category else [],
                     "next_steps": actionable_result.get("next_steps", []),
                     "remediation_timeline": actionable_result.get("remediation_timeline", {}),
+                    # Timestamp for actionable intelligence content so frontend can show completed time
+                    "timestamp": (scan.completed_at if scan.completed_at else scan.created_at).isoformat() if (scan.completed_at or scan.created_at) else datetime.utcnow().isoformat(),
                 }
             },
             "timestamp": scan.created_at.isoformat() if scan.created_at else datetime.utcnow().isoformat(),

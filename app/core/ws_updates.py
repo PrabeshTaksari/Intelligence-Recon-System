@@ -1,36 +1,75 @@
-"""
-WebSocket/SSE update stubs (live status tracker backend removed).
-Frontend uses polling GET /api/scans/{id}/status only.
+"""In-process scan update fan-out for SSE clients.
+
+This module intentionally does not use WebSockets. It keeps a per-scan list of
+asyncio queues. The SSE endpoint registers a queue for each connected client,
+and the scan workflow broadcasts update payloads into those queues.
 """
 
+import asyncio
 import logging
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Set
 
 logger = logging.getLogger(__name__)
 
-ws_manager = None
-WEBSOCKET_MANAGER_AVAILABLE = False
+_scan_subscribers: Dict[int, Set[asyncio.Queue]] = {}
+_subscriber_lock = asyncio.Lock()
 
 
 def init_websocket_manager():
-    """No-op: live push disabled."""
-    pass
+    """Compatibility no-op kept for existing scan startup flow."""
+    return None
 
 
-async def register_connection(websocket):
-    """No-op."""
-    pass
+async def register_connection(scan_id: int) -> asyncio.Queue:
+    """Register an SSE subscriber queue for a scan."""
+    queue: asyncio.Queue = asyncio.Queue(maxsize=200)
+    async with _subscriber_lock:
+        subscribers = _scan_subscribers.setdefault(scan_id, set())
+        subscribers.add(queue)
+    logger.debug("Registered SSE subscriber for scan %s", scan_id)
+    return queue
 
 
-async def unregister_connection(websocket):
-    """No-op."""
-    pass
+async def unregister_connection(scan_id: int, queue: asyncio.Queue) -> None:
+    """Remove an SSE subscriber queue for a scan."""
+    async with _subscriber_lock:
+        subscribers = _scan_subscribers.get(scan_id)
+        if not subscribers:
+            return
+        subscribers.discard(queue)
+        if not subscribers:
+            _scan_subscribers.pop(scan_id, None)
+    logger.debug("Unregistered SSE subscriber for scan %s", scan_id)
 
 
 async def broadcast(message: Dict[str, Any]):
-    """No-op: no SSE/WebSocket; frontend polls status."""
-    pass
+    """Broadcast a scan event to all SSE subscribers for that scan."""
+    scan_id = message.get("scan_id")
+    if scan_id is None:
+      return
+
+    if isinstance(scan_id, str) and scan_id.isdigit():
+        scan_id = int(scan_id)
+
+    async with _subscriber_lock:
+        subscribers = list(_scan_subscribers.get(scan_id, set()))
+
+    if not subscribers:
+        return
+
+    for queue in subscribers:
+        try:
+            queue.put_nowait(message)
+        except asyncio.QueueFull:
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                queue.put_nowait(message)
+            except asyncio.QueueFull:
+                logger.debug("Dropped SSE update for scan %s because subscriber queue is full", scan_id)
 
 
 async def send_tool_start_update(scan_id: int, tool_name: str):
@@ -73,7 +112,7 @@ async def send_log_message(scan_id: int, tool_name: str, message: str):
 
 async def send_scan_status_update(scan_id: int, status: str):
     logger.info(f"[Scan {scan_id}] Scan status: {status}")
-    await broadcast({"type": "scan_status", "scan_id": scan_id, "status": status})
+    await broadcast({"type": "scan_status", "scan_id": scan_id, "status": status, "timestamp": time.time()})
 
 
 async def send_scan_phase_update(scan_id: int, phase: str, details: Dict[str, Any] = None):
