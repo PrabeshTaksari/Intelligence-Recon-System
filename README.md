@@ -7,11 +7,16 @@ This repository also contains the academic project documentation (proposal, inte
 Overview
 
 Given a target (domain or IP), IRS runs a pipeline of reconnaissance and vulnerability-scanning tools, then feeds the combined output to an AI decision layer that:
+  1. Decides which follow-up tools to run based on initial findings (e.g. discovered subdomains feed into further enumeration and exploitation tools)
+  2. Summarizes results into an Executive Summary and Key Findings
+  3. Maps findings to OWASP Top 10 (2021) categories
+  4. Produces a severity distribution and historical scan trend data
+  5. Generates a shareable HTML/PDF report
+  6. It also supports scheduled recurring scans and email alerts when a scan completes.
 
-**Decides which follow-up tools to run based on initial findings (e.g. discovered subdomains feed into further enumeration and exploitation tools)
-Summarizes results into an Executive Summary and Key Findings
-Maps findings to OWASP Top 10 (2021) categories
-Produces a severity distribution and historical scan trend data
-Generates a shareable HTML/PDF report
-It also supports scheduled recurring scans and email alerts when a scan completes.
-**
+Architecture
+ 1. Backend: FastAPI (Python, async), SQLAlchemy + SQLite (fastapi, uvicorn[standard], python-dotenv, sqlalchemy, aiosqlite, httpx, weasyprint — see                requirements.txt)
+ 2.Frontend: Static HTML/CSS/JS served directly by the backend
+ 3. AI layer: Google Gemini (configurable model/backends), used for the decision engine and report generation, with local fallbacks when disabled
+ 4. Recon/scanning tools: Shelled out to as external CLI binaries (ProjectDiscovery suite and others)
+ 5. Reporting: WeasyPrint (HTML → PDF)
