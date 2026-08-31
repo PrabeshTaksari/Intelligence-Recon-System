@@ -5,3 +5,6 @@ sqlalchemy
 aiosqlite
 httpx
 weasyprint
+dnspython
+requests
+pytz
