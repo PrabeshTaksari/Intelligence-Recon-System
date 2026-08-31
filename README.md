@@ -69,21 +69,21 @@ If any of these aren't already on your system, install them first:
 Update package lists
 sudo apt update
 
-# Python, pip, venv, git
+Python, pip, venv, git
 sudo apt install -y python3 python3-pip python3-venv git
 
-# Go (for the recon tool installers)
+Go (for the recon tool installers)
 sudo apt install -y golang-go
-# If your distro's Go is too old, install manually instead:
-#   wget https://go.dev/dl/go1.22.linux-amd64.tar.gz
-#   sudo tar -C /usr/local -xzf go1.22.linux-amd64.tar.gz
-#   echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
-#   source ~/.bashrc
+If your distro's Go is too old, install manually instead:
+   wget https://go.dev/dl/go1.22.linux-amd64.tar.gz
+   sudo tar -C /usr/local -xzf go1.22.linux-amd64.tar.gz
+   echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
+   source ~/.bashrc
 
-# Ruby + RubyGems (for CeWL)
+Ruby + RubyGems (for CeWL)
 sudo apt install -y ruby-full
 
-# System libraries required by WeasyPrint (PDF report generation)
+System libraries required by WeasyPrint (PDF report generation)
 sudo apt install -y libpango-1.0-0 libpangocairo-1.0-0 libcairo2 \
     libgdk-pixbuf2.0-0 libffi-dev shared-mime-info
 
