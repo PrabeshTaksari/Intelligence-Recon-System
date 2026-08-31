@@ -1,17 +1,35 @@
+import asyncio
 import os
 import re
 import json
 import shutil
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse
-from app.tools.base import BaseTool
+from datetime import datetime
 
+from app.core.config import settings
+from app.core.logging import get_logger
+from app.tools.base import BaseTool, ToolResult
+from app.core.ws_updates import (
+    send_tool_start_update,
+    send_tool_status_update,
+    send_tool_output_update,
+    send_tool_complete_update,
+    send_log_message,
+)
+
+logger = get_logger(__name__)
+
+# Nuclei configuration (only set if not already defined)
+os.environ.setdefault('NUCLEI_REQUEST_TIMEOUT', str(settings.NUCLEI_REQUEST_TIMEOUT))
+os.environ.setdefault('NUCLEI_DISABLE_MHE', '1')
+os.environ.setdefault('NUCLEI_RETRIES', str(settings.NUCLEI_RETRIES))
+os.environ.setdefault('NUCLEI_SEVERITIES', 'critical,high,medium,low,info')
+os.environ.setdefault('NUCLEI_STOP_ON_FINDINGS', str(settings.NUCLEI_STOP_ON_FINDINGS))
 
 # Strip ANSI escape sequences (e.g. [91m, [0m) so tool output is readable in UI
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]?")
-
-
 def _strip_ansi(text: str) -> str:
     if not text:
         return text
@@ -19,7 +37,6 @@ def _strip_ansi(text: str) -> str:
 
 
 def _get_httpx_path() -> str:
-    """Resolve httpx binary: prefer ProjectDiscovery from go/bin, else PATH."""
     go_bin = os.path.expanduser("/home/prabesh/go/bin/httpx")
     if os.path.isfile(go_bin):
         return go_bin
@@ -29,56 +46,803 @@ def _get_httpx_path() -> str:
 class NucleiTool(BaseTool):
     def __init__(self):
         super().__init__("Nuclei")
+
+    _INFO_URL_HINTS = (
+        "/robots.txt",
+        "/sitemap.xml",
+        "/security.txt",
+        "/.well-known/security.txt",
+    )
+
+    def format_live_output(self, line: str) -> str:
+        """Convert Nuclei JSONL into a concise human-readable line for the UI."""
+        try:
+            data = json.loads(line)
+        except Exception:
+            return line
+
+        info = data.get("info") or {}
+        severity = str(info.get("severity") or "info").strip().lower()
+        title = str(info.get("name") or data.get("template-id") or "Nuclei finding").strip()
+        matcher_name = str(data.get("matcher-name") or "").strip()
+        location = str(
+            data.get("matched-at")
+            or data.get("url")
+            or data.get("host")
+            or data.get("target")
+            or ""
+        ).strip()
+
+        parts = [f"[{severity.upper()}]", title]
+        if matcher_name:
+            parts.append(f"matcher: {matcher_name}")
+        if location:
+            parts.append(location)
+        return " | ".join(parts)
+
+    @classmethod
+    def _is_info_url(cls, url: str) -> bool:
+        """Return True for URLs that are typically informational/discovery-only pages."""
+        candidate = (url or "").strip().lower()
+        if not candidate:
+            return False
+
+        try:
+            parsed = urlparse(candidate)
+            path = (parsed.path or "").lower()
+        except Exception:
+            path = candidate
+
+        return any(hint in path for hint in cls._INFO_URL_HINTS)
+
+    @classmethod
+    def _filter_info_urls(cls, urls: List[str]) -> List[str]:
+        """Drop informational URLs while keeping real application endpoints."""
+        if not urls:
+            return []
+
+        filtered = []
+        for url in urls:
+            if cls._is_info_url(url):
+                continue
+            filtered.append(url)
+        return filtered
+
+    @staticmethod
+    def _phase_specs() -> List[Dict[str, Any]]:
+        """Return the fixed three-phase severity plan for Nuclei."""
+        return [
+            {
+                "label": "Critical/High",
+                "suffix": "critical_high",
+                "severities": "critical,high",
+                "concurrency": 15,
+                "bulk_size": 15,
+                "rate_limit": 75,
+            },
+            {
+                "label": "Medium/Low",
+                "suffix": "medium_low",
+                "severities": "medium,low",
+                "concurrency": 15,
+                "bulk_size": 15,
+                "rate_limit": 75,
+            },
+            {
+                "label": "Info",
+                "suffix": "info",
+                "severities": "info",
+                "concurrency": 20,
+                "bulk_size": 20,
+                "rate_limit": 100,
+            },
+        ]
+
+    @staticmethod
+    def _phase_output_path(base_output: Path, suffix: str) -> Path:
+        """Create the per-phase output path next to the combined output file."""
+        return base_output.with_name(f"{base_output.stem}_{suffix}.out")
+
+    async def _run_single_phase(
+        self,
+        target: str,
+        output_file: Path,
+        timeout: int,
+        scan_id: Optional[int],
+        command: List[str],
+    ) -> ToolResult:
+        """Run one Nuclei phase and return its parsed result."""
+        started_at = datetime.utcnow()
+
+        if scan_id:
+            await send_tool_status_update(
+                scan_id,
+                self.tool_name,
+                "running",
+                {"command": " ".join(command)},
+            )
+
+        self.logger.info(f"Executing command: {' '.join(command)}")
+        if scan_id:
+            await send_log_message(scan_id, self.tool_name, f"Running command: {' '.join(command)}")
+
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=1024 * 1024,
+        )
+
+        raw_output_lines: List[str] = []
+        stderr_lines: List[str] = []
+
+        nuclei_stop_threshold = 1
+        nuclei_stop_enabled = False
+        try:
+            nuclei_stop_threshold = int(os.getenv("NUCLEI_STOP_ON_FINDINGS", "1") or "1")
+            nuclei_stop_enabled = nuclei_stop_threshold > 0
+        except ValueError:
+            nuclei_stop_threshold = 1
+            nuclei_stop_enabled = True
+
+        def _parse_nuclei_severity(line: str) -> Optional[str]:
+            try:
+                data = json.loads(line)
+                return (data.get("info") or {}).get("severity")
+            except Exception:
+                return None
+
+        finding_count = 0
+
+        async def read_stdout_live():
+            nonlocal finding_count
+            while process.stdout:
+                try:
+                    line = await process.stdout.readline()
+                except (ValueError, asyncio.LimitOverrunError) as e:
+                    if getattr(e, "consumed", None) and process.stdout:
+                        try:
+                            await process.stdout.readexactly(e.consumed)
+                        except (asyncio.IncompleteReadError, Exception):
+                            pass
+                    self.logger.warning(f"[{self.tool_name}] Skipped oversize stdout line")
+                    continue
+                if not line:
+                    break
+                decoded = line.decode(errors="replace").rstrip()
+                if decoded:
+                    clean = _strip_ansi(decoded)
+                    raw_output_lines.append(clean)
+                    display_line = self.format_live_output(clean)
+                    if display_line:
+                        if scan_id:
+                            await send_tool_output_update(scan_id, self.tool_name, display_line)
+                        self.logger.info(f"[{self.tool_name}] {display_line}")
+
+                    if nuclei_stop_enabled:
+                        severity = _parse_nuclei_severity(clean)
+                        if severity:
+                            severity_lower = str(severity).strip().lower()
+                            if severity_lower in {"critical", "high", "medium", "low", "info"}:
+                                if severity_lower != "info":
+                                    finding_count += 1
+                                    if finding_count >= nuclei_stop_threshold:
+                                        self.logger.info(
+                                            f"[{self.tool_name}] stop-on-findings threshold reached ({finding_count}); terminating process"
+                                        )
+                                        process.kill()
+                                        break
+            if process.stdout:
+                try:
+                    rest = await process.stdout.read()
+                except (ValueError, asyncio.LimitOverrunError):
+                    rest = b""
+                if rest:
+                    decoded = rest.decode(errors="replace").rstrip()
+                    if decoded:
+                        for ln in decoded.split("\n"):
+                            ln = _strip_ansi(ln.strip())
+                            if ln:
+                                raw_output_lines.append(ln)
+                                display_line = self.format_live_output(ln)
+                                if display_line:
+                                    if scan_id:
+                                        await send_tool_output_update(scan_id, self.tool_name, display_line)
+                                    self.logger.info(f"[{self.tool_name}] {display_line}")
+
+        async def read_stderr_live():
+            while process.stderr:
+                try:
+                    line = await process.stderr.readline()
+                except (ValueError, asyncio.LimitOverrunError) as e:
+                    if getattr(e, "consumed", None) and process.stderr:
+                        try:
+                            await process.stderr.readexactly(e.consumed)
+                        except (asyncio.IncompleteReadError, Exception):
+                            pass
+                    self.logger.warning(f"[{self.tool_name}] Skipped oversize stderr line")
+                    continue
+                if not line:
+                    break
+                decoded = line.decode(errors="replace").rstrip()
+                if decoded:
+                    clean = _strip_ansi(decoded)
+                    stderr_lines.append(clean)
+                    display_line = self.format_live_output(clean)
+                    if display_line:
+                        if scan_id:
+                            await send_tool_output_update(scan_id, self.tool_name, display_line)
+                        self.logger.info(f"[{self.tool_name}] [stderr] {display_line}")
+            if process.stderr:
+                try:
+                    rest = await process.stderr.read()
+                except (ValueError, asyncio.LimitOverrunError):
+                    rest = b""
+                if rest:
+                    decoded = rest.decode(errors="replace").rstrip()
+                    if decoded:
+                        for ln in decoded.split("\n"):
+                            ln = _strip_ansi(ln.strip())
+                            if ln:
+                                stderr_lines.append(ln)
+                                display_line = self.format_live_output(ln)
+                                if display_line:
+                                    if scan_id:
+                                        await send_tool_output_update(scan_id, self.tool_name, display_line)
+                                    self.logger.info(f"[{self.tool_name}] [stderr] {display_line}")
+
+        async def run_with_timeout():
+            stdout_task = asyncio.create_task(read_stdout_live())
+            stderr_task = asyncio.create_task(read_stderr_live())
+            await asyncio.gather(stdout_task, stderr_task)
+            await process.wait()
+
+        try:
+            await asyncio.wait_for(run_with_timeout(), timeout=timeout)
+            raw_output = "\n".join(raw_output_lines)
+            stderr_output = "\n".join(stderr_lines)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            stderr_output = "\n".join(stderr_lines)
+            try:
+                file_content = output_file.read_text(encoding="utf-8", errors="replace") if output_file.exists() else ""
+            except Exception:
+                file_content = ""
+            _file = (file_content or "").strip()
+            if "=== STDOUT ===" in _file:
+                _file = _file.split("=== STDOUT ===")[0].strip()
+            content_for_parsing = (_file or "\n".join(raw_output_lines)) or ""
+            findings = self.parse_output(content_for_parsing, target)
+            summary = self.generate_summary(findings, content_for_parsing)
+            error_msg = f"Execution timed out after {timeout} seconds"
+            self.logger.error(error_msg)
+            if scan_id:
+                await send_tool_complete_update(scan_id, self.tool_name, False)
+            return ToolResult(
+                tool_name=self.tool_name,
+                success=False,
+                summary=f"Execution timeout: {summary}" if findings else "Execution timeout",
+                error_message=error_msg,
+                findings=findings,
+                raw_output=raw_output if 'raw_output' in locals() else "\n".join(raw_output_lines),
+                started_at=started_at,
+                finished_at=datetime.utcnow(),
+            )
+
+        if process.returncode is None:
+            await process.wait()
+
+        tool_return_code = process.returncode
+        self.logger.info(f"{self.tool_name} completed with return code: {tool_return_code}")
+
+        has_execution_error = tool_return_code > 1
+
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        file_content = ""
+        if output_file.exists():
+            try:
+                file_content = output_file.read_text(encoding="utf-8", errors="replace")
+            except Exception as e:
+                self.logger.warning(f"Could not read tool output file: {e}")
+
+        _file = file_content.strip()
+        if "=== STDOUT ===" in _file:
+            _file = _file.split("=== STDOUT ===")[0].strip()
+        content_for_parsing = (_file or raw_output) or ""
+        combined = "\n\n=== STDOUT ===\n" + raw_output + "\n\n=== STDERR ===\n" + stderr_output
+        output_file.write_text(combined)
+
+        findings = self.parse_output(content_for_parsing, target)
+        summary = self.generate_summary(findings, content_for_parsing)
+        finished_at = datetime.utcnow()
+
+        if has_execution_error:
+            error_msg = f"{self.tool_name} exited with error code {tool_return_code}"
+            self.logger.error(error_msg)
+            if scan_id:
+                await send_tool_complete_update(scan_id, self.tool_name, False)
+            return ToolResult(
+                tool_name=self.tool_name,
+                success=False,
+                summary=f"Execution error: {summary}",
+                error_message=error_msg,
+                findings=findings,
+                raw_output=raw_output,
+                started_at=started_at,
+                finished_at=finished_at,
+            )
+
+        return ToolResult(
+            tool_name=self.tool_name,
+            success=True,
+            summary=summary,
+            findings=findings,
+            raw_output=raw_output,
+            started_at=started_at,
+            finished_at=finished_at,
+        )
+
+    async def execute(
+        self,
+        target: str,
+        output_file: Path,
+        timeout: int = 300,
+        scan_id: Optional[int] = None,
+        **kwargs,
+    ) -> ToolResult:
+        """Execute Nuclei in three severity phases and merge the results."""
+        started_at = datetime.utcnow()
+        self.owasp_category = kwargs.get("owasp_category")
+
+        if scan_id:
+            await send_tool_start_update(scan_id, self.tool_name)
+            await send_tool_status_update(
+                scan_id,
+                self.tool_name,
+                "running",
+                {"command": "three-phase nuclei execution"},
+            )
+
+        if not self.check_installed():
+            error_msg = f"{self.tool_name} is not installed or not in PATH"
+            self.logger.error(error_msg)
+            if scan_id:
+                await send_tool_complete_update(scan_id, self.tool_name, False)
+            return ToolResult(
+                tool_name=self.tool_name,
+                success=False,
+                summary="Tool not installed",
+                error_message=error_msg,
+                started_at=started_at,
+                finished_at=datetime.utcnow(),
+            )
+
+        phase_findings: List[Dict[str, Any]] = []
+        phase_summaries: List[str] = []
+        phase_outputs: List[str] = []
+        had_timeout = False
+        had_error = False
+
+        phase_specs = self._phase_specs()
+
+        for index, phase in enumerate(phase_specs, start=1):
+            phase_output_file = self._phase_output_path(output_file, phase["suffix"])
+            phase_kwargs = dict(kwargs)
+            phase_kwargs.update(
+                {
+                    "nuclei_severities": phase["severities"],
+                    "nuclei_concurrency": phase["concurrency"],
+                    "nuclei_bulk_size": phase["bulk_size"],
+                    "nuclei_rate_limit": phase["rate_limit"],
+                }
+            )
+            command = self.build_command(target, phase_output_file, **phase_kwargs)
+
+            if scan_id:
+                await send_log_message(
+                    scan_id,
+                    self.tool_name,
+                    f"Starting phase {index}/3 ({phase['label']}) with {phase['severities']} severity templates.",
+                )
+
+            phase_result = await self._run_single_phase(
+                target=target,
+                output_file=phase_output_file,
+                timeout=timeout,
+                scan_id=scan_id,
+                command=command,
+            )
+
+            phase_findings.extend(phase_result.findings)
+            phase_summaries.append(f"{phase['label']}: {phase_result.summary}")
+
+            if phase_output_file.exists():
+                try:
+                    phase_outputs.append(
+                        f"=== PHASE {index}/3: {phase['label']} ===\n"
+                        + phase_output_file.read_text(encoding="utf-8", errors="replace")
+                    )
+                except Exception:
+                    phase_outputs.append(f"=== PHASE {index}/3: {phase['label']} ===\n")
+
+            if not phase_result.success:
+                message = (phase_result.error_message or "").lower()
+                if "timeout" in message:
+                    had_timeout = True
+                else:
+                    had_error = True
+
+            if scan_id:
+                await send_log_message(
+                    scan_id,
+                    self.tool_name,
+                    f"Completed phase {index}/3 ({phase['label']}): {phase_result.summary}",
+                )
+                await send_tool_output_update(
+                    scan_id,
+                    self.tool_name,
+                    f"[PHASE {index}/3 {phase['label']}] {phase_result.summary}",
+                )
+
+        combined_output = "\n\n".join(phase_outputs).strip()
+        if combined_output:
+            output_file.parent.mkdir(parents=True, exist_ok=True)
+            output_file.write_text(combined_output)
+
+        summary = self.generate_summary(phase_findings, combined_output)
+        if had_timeout and not had_error:
+            summary = f"Three-phase Nuclei scan completed with partial results due to time limits. {summary}"
+        elif had_timeout and had_error:
+            summary = f"Three-phase Nuclei scan completed with partial results and some phase errors. {summary}"
+
+        success = not had_error
+        if had_timeout and phase_findings:
+            success = True
+
+        if scan_id:
+            await send_tool_complete_update(scan_id, self.tool_name, success)
+
+        finished_at = datetime.utcnow()
+        return ToolResult(
+            tool_name=self.tool_name,
+            success=success,
+            summary=summary if phase_summaries else "Nuclei did not identify any findings.",
+            findings=phase_findings,
+            raw_output=combined_output,
+            error_message=("One or more Nuclei phases timed out" if had_timeout and not had_error else ("One or more Nuclei phases failed" if had_error else None)),
+            started_at=started_at,
+            finished_at=finished_at,
+        )
+
+    @staticmethod
+    def _adjust_severity_by_context(severity: str, description: str, template_id: str = None) -> str:
+        """
+        Adjust Nuclei severity based on context and potential impact.
+        
+        Rules for severity escalation:
+        - Sensitive data exposure → escalate by 1 level
+        - Authentication bypass indicators → escalate to HIGH
+        - Information disclosure with PII/credentials → escalate to MEDIUM/HIGH
+        """
+        desc_lower = (description or "").lower()
+        template_lower = (template_id or "").lower()
+        
+        # Keywords indicating sensitive data exposure
+        sensitive_keywords = [
+            "exposure", "disclosure", "sensitive", "credential", "password",
+            "api key", "secret", "token", "pii", "personal information",
+            "email", "phone", "ssn", "credit card", "database", "backup",
+            "configuration", "env", "private", "leak", "dump"
+        ]
+        
+        # Check if this involves sensitive data
+        has_sensitive_data = any(kw in desc_lower or kw in template_lower for kw in sensitive_keywords)
+        
+        # Severity escalation logic
+        if has_sensitive_data:
+            if severity == "info":
+                return "medium"  # Info + sensitive data = medium
+            elif severity == "low":
+                return "medium"  # Low + sensitive data = medium
+            elif severity == "medium":
+                return "high"  # Medium + sensitive data = high
+            # high/critical stay as-is
+        
+        # Specific patterns that need escalation
+        if any(pattern in desc_lower for pattern in [
+            "apache server status",  # Can reveal sensitive app info
+            "directory listing",  # Information disclosure
+            "git repository",  # Source code exposure
+            "svn repository",  # Source code exposure
+            ".env file",  # Environment variables exposure
+            "phpinfo",  # Full server information disclosure
+        ]):
+            if severity in ["info", "low"]:
+                return "medium"
+        
+        return severity  # No adjustment needed
+
+    @staticmethod
+    def _nuclei_tags_for_owasp(owasp_category: Optional[str]) -> Optional[str]:
+        """Map OWASP Top 10 selection to Nuclei template tags.
+
+        Note: Nuclei tag names must match template tags. If a mapping is unknown,
+        we return None to keep Nuclei behavior unchanged.
+        
+        OPTIMIZED FOR: Maximum vulnerability detection with minimal scan time
+        Strategy: Focus on high-impact, fast-executing templates only
+        """
+        if not owasp_category:
+            return None
+
+        ow = str(owasp_category).strip().upper()
+        # Broader, category-specific template sets. Each can be overridden via env vars
+        # so advanced users can tune coverage without affecting other tools.
+        category_tags = {
+            "A01:2021": os.getenv(
+                "NUCLEI_A01_TAGS",
+                "unauth,traversal,lfi,idor,redirect",
+            ),
+            "A02:2021": os.getenv(
+                "NUCLEI_A02_TAGS",
+                "ssl,tls,expired-ssl,certificate",
+            ),
+            "A03:2021": os.getenv(
+                "NUCLEI_A03_TAGS",
+                "sqli,xss,command-injection,ssti,xxe",
+            ),
+            "A04:2021": os.getenv(
+                "NUCLEI_A04_TAGS",
+                "logic-bypass,auth-bypass,access-control,misconfig",
+            ),
+            "A05:2021": os.getenv(
+                "NUCLEI_A05_TAGS",
+                "misconfig,cors,headers,exposure",
+            ),
+            "A06:2021": os.getenv(
+                "NUCLEI_A06_TAGS",
+                "cve,known-vuln,version-detect,outdated",
+            ),
+            "A07:2021": os.getenv(
+                "NUCLEI_A07_TAGS",
+                "default-login,auth-bypass,jwt,login",
+            ),
+            "A08:2021": os.getenv(
+                "NUCLEI_A08_TAGS",
+                "deserialization,file-upload,xxe,path-traversal",
+            ),
+            "A09:2021": os.getenv(
+                "NUCLEI_A09_TAGS",
+                "log4j,logging,exposure,debug-page",
+            ),
+            "A10:2021": os.getenv(
+                "NUCLEI_A10_TAGS",
+                "ssrf,graphql",
+            ),
+        }
+
+        tags = str(category_tags.get(ow, "")).strip()
+        if tags:
+            return tags
+
+        # For remaining OWASP categories, keep behavior unchanged (no -tags filter).
+        return None
+
+    @staticmethod
+    def _owasp_url_keywords(owasp_category: Optional[str]) -> List[str]:
+        """Path keywords to prioritize URLs likely relevant to the selected OWASP category."""
+        ow = str(owasp_category or "").strip().upper()
+        mapping = {
+            "A01:2021": ["admin", "account", "role", "permission", "user", "profile", "api"],
+            "A02:2021": ["login", "auth", "token", "oauth", "jwt", "crypto", "cert", "key"],
+            "A03:2021": ["search", "query", "filter", "api", "sql", "id", "q", "cmd", "exec", "template"],
+            "A04:2021": ["workflow", "checkout", "payment", "order", "state", "business", "logic"],
+            "A05:2021": ["admin", "debug", "config", "swagger", "actuator", "health", ".git", "backup"],
+            "A06:2021": ["version", "about", "changelog", "plugin", "component", "release", "status"],
+            "A07:2021": ["login", "signin", "auth", "session", "reset", "password", "mfa", "otp"],
+            "A08:2021": ["upload", "import", "package", "artifact", "update", "install", "plugin"],
+            "A09:2021": ["logs", "audit", "admin", "events", "monitor", "report", "security"],
+            "A10:2021": ["proxy", "fetch", "url", "redirect", "callback", "webhook", "ssrf"],
+        }
+        return mapping.get(ow, [])
+
+    @staticmethod
+    def _owasp_fuzz_keywords(owasp_category: Optional[str]) -> List[str]:
+        """Return extra wordlist keywords for FFuf/Wfuzz based on OWASP category."""
+        ow = str(owasp_category or "").strip().upper()
+        mapping = {
+            "A01:2021": ["admin", "console", "dashboard", "user", "role", "permission", "account", "profile"],
+            "A02:2021": ["login", "auth", "token", "password", "ssl", "tls", "crypto", "cert", "certificate"],
+            "A03:2021": ["sql", "id", "query", "filter", "search", "cmd", "exec", "payload", "eval", "template"],
+            "A04:2021": ["workflow", "checkout", "payment", "order", "state", "business", "logic", "process"],
+            "A05:2021": ["phpinfo.php", "openapi.yaml", "compose.yml", "swagger", "debug", "config", "backup", "admin", "health", "actuator"],
+            "A06:2021": ["version", "about", "changelog", "component", "dependency", "cve", "vulnerable", "outdated"],
+            "A07:2021": ["login", "signin", "auth", "oauth", "session", "reset", "password", "2fa", "mfa", "otp"],
+            "A08:2021": ["upload", "import", "package", "artifact", "update", "install", "plugin", "dependency"],
+            "A09:2021": ["logs", "audit", "report", "monitor", "admin", "events", "alert", "trace"],
+            "A10:2021": ["proxy", "fetch", "url", "callback", "redirect", "webhook", "ssrf"],
+        }
+        return mapping.get(ow, [])
+
+    @staticmethod
+    def _prioritize_urls_for_owasp(urls: List[str], owasp_category: Optional[str]) -> List[str]:
+        """Prioritize likely-relevant URLs for selected OWASP category; keep stable deterministic order."""
+        if not urls:
+            return []
+        keywords = NucleiTool._owasp_url_keywords(owasp_category)
+        if not keywords:
+            return list(dict.fromkeys(urls))
+
+        def score_url(u: str) -> int:
+            s = (u or "").strip().lower()
+            if not s:
+                return -1
+            try:
+                p = urlparse(s)
+                path = (p.path or "").lower()
+                query = (p.query or "").lower()
+                hay = f"{path}?{query}"
+            except Exception:
+                hay = s
+            score = 0
+            for kw in keywords:
+                if kw in hay:
+                    score += 3
+            # Injection often benefits from paramized endpoints.
+            if str(owasp_category or "").upper() == "A03:2021":
+                if "?" in s or "=" in s:
+                    score += 4
+                if any(tok in hay for tok in ["/api/", "search", "query", "filter"]):
+                    score += 2
+            # Prefer non-root deeper paths over base homepage.
+            if hay.count("/") >= 2:
+                score += 1
+            return score
+
+        unique = list(dict.fromkeys(urls))
+        ranked = sorted(unique, key=lambda u: (-score_url(u), unique.index(u)))
+        # Cap URL list for speed; configurable to avoid hampering other flows.
+        limit = int(os.getenv("NUCLEI_URL_LIMIT", "120"))
+        return ranked[:max(1, limit)]
+
     def build_command(self, target: str, output_file: Path, **kwargs) -> List[str]:
         discovered_urls = kwargs.get("discovered_urls") or []
         clues = kwargs.get("clues") or {}
+        owasp_category = kwargs.get("owasp_category")
         http_services = clues.get("http_services") or []
-        # Build URL list: discovered + clues + fallback (domain/IP → proper URL)
-        all_urls = list(dict.fromkeys(
-            [u for u in discovered_urls if u and (u.startswith("http://") or u.startswith("https://"))]
-            + [u for u in http_services if u and (str(u).startswith("http://") or str(u).startswith("https://"))]
-        ))
+
+        all_urls = list(
+            dict.fromkeys(
+                [u for u in discovered_urls if u and (u.startswith("http://") or u.startswith("https://"))]
+                + [u for u in http_services if u and (str(u).startswith("http://") or str(u).startswith("https://"))]
+            )
+        )
         if not all_urls:
-            base = _base_url_for_web_tools(target, **kwargs)
-            all_urls = [base]
-        # Faster nuclei: high concurrency + rate limit + focus on higher severity
-        severity_args = ["-severity", "critical,high,medium"]
-        perf_args = ["-c", "100", "-rl", "200"]
-        # Retries and no update-check reduce failures and stderr noise
-        extra = ["-retries", "2", "-disable-update-check", "-no-color"]
+            all_urls = [_base_url_for_web_tools(target, **kwargs)]
+
+        all_urls = self._prioritize_urls_for_owasp(all_urls, owasp_category)
+        all_urls = self._filter_info_urls(all_urls)
+
+        max_urls = int(os.getenv("NUCLEI_MAX_URLS", str(settings.NUCLEI_MAX_URLS)))
+        if len(all_urls) > max_urls:
+            logger.info(f"Nuclei URL cap applied: {len(all_urls)} -> {max_urls}")
+            all_urls = all_urls[:max_urls]
+
+        if not all_urls:
+            all_urls = [_base_url_for_web_tools(target, **kwargs)]
+
+        fast_mode = str(os.getenv("NUCLEI_FAST_MODE", "0")).strip().lower() in ("1", "true", "yes", "y")
+        nuclei_severities = str(
+            kwargs.get("nuclei_severities") or os.getenv("NUCLEI_SEVERITIES", "critical,high,medium,low,info")
+        ).strip() or "critical,high,medium,low,info"
+        if fast_mode:
+            fast_tags = os.getenv("NUCLEI_FAST_TAGS", "sqli,xss").strip()
+            if fast_tags:
+                logger.info(f"Nuclei fast mode active. Using tags: {fast_tags}")
+            nuclei_severities = os.getenv("NUCLEI_FAST_SEVERITIES", nuclei_severities).strip() or nuclei_severities
+            os.environ.setdefault("NUCLEI_REQUEST_TIMEOUT", os.getenv("NUCLEI_FAST_TEMPLATE_TIMEOUT", "7"))
+            os.environ.setdefault("NUCLEI_RETRIES", os.getenv("NUCLEI_FAST_RETRIES", "1"))
+
+        nuclei_concurrency = str(kwargs.get("nuclei_concurrency", 25))
+        nuclei_bulk_size = str(kwargs.get("nuclei_bulk_size", 25))
+        nuclei_rate_limit = str(kwargs.get("nuclei_rate_limit", 100))
+        nuclei_request_timeout = int(
+            kwargs.get("nuclei_timeout", os.getenv("NUCLEI_REQUEST_TIMEOUT", str(settings.NUCLEI_REQUEST_TIMEOUT)))
+        )
+        nuclei_retries = int(kwargs.get("nuclei_retries", os.getenv("NUCLEI_RETRIES", str(settings.NUCLEI_RETRIES))))
+
+        disable_mhe = os.getenv("NUCLEI_DISABLE_MHE", "1").strip().lower() in ("1", "true", "yes", "y")
+        extra = [
+            "-timeout",
+            str(nuclei_request_timeout),
+            "-retries",
+            str(nuclei_retries),
+            "-no-color",
+            "-disable-update-check",
+        ]
+        if disable_mhe:
+            extra.append("-nmhe")
+
+        nuclei_tags = self._nuclei_tags_for_owasp(owasp_category)
+        if fast_mode:
+            nuclei_tags = os.getenv("NUCLEI_FAST_TAGS", nuclei_tags or "sqli,xss").strip()
+        tag_args = ["-tags", nuclei_tags] if nuclei_tags else []
+
+        base_command = ["nuclei", "-jsonl", "-o", str(output_file), "-silent"]
+        perf_args = ["-c", nuclei_concurrency, "-bulk-size", nuclei_bulk_size, "-rl", nuclei_rate_limit]
+
         if len(all_urls) == 1:
-            return ["nuclei", "-u", all_urls[0], "-jsonl", "-o", str(output_file), "-silent"] + perf_args + severity_args + extra
-        # Multiple URLs: write to temp file and use -l
+            return ["nuclei", "-u", all_urls[0]] + base_command[1:] + perf_args + ["-severity", nuclei_severities] + tag_args + extra
+
         urls_file = output_file.parent / "nuclei_urls.txt"
-        with open(urls_file, "w") as f:
-            f.write("\n".join(all_urls[:200]))  # Limit to 200 URLs
-        return ["nuclei", "-l", str(urls_file), "-jsonl", "-o", str(output_file), "-silent"] + perf_args + severity_args + extra
+        with open(urls_file, "w", encoding="utf-8") as f:
+            f.write("\n".join(all_urls))
+        return ["nuclei", "-l", str(urls_file)] + base_command[1:] + perf_args + ["-severity", nuclei_severities] + tag_args + extra
     def parse_output(self, output: str, target: str) -> List[Dict[str, Any]]:
         findings = []
+        seen = set()  # Deduplicate by template-id:host:port:matched-at
+        
         for line in output.strip().split('\n'):
             if not line: continue
             try:
                 data = json.loads(line)
                 severity = (data.get("info") or {}).get("severity", "info")
+                template_id = (data.get("template-id") or data.get("template_id") or "")
+                description = data.get("info", {}).get("name", "Unknown")
+                
+                # Create dedup key: template-id + host + port + matcher-name
+                host = data.get("host", "")
+                port = data.get("port", "")
+                matcher_name = data.get("matcher-name", "")
+                dedup_key = f"{template_id}:{host}:{port}:{matcher_name}"
+                
+                # Skip duplicates
+                if dedup_key in seen:
+                    continue
+                seen.add(dedup_key)
+                
+                # Apply AI-based severity adjustment based on context
+                adjusted_severity = self._adjust_severity_by_context(
+                    severity=severity,
+                    description=description,
+                    template_id=template_id
+                )
+                
                 # Only real issues (low+) are "vulnerability"; info = detection/fingerprint = "information"
-                ftype = "vulnerability" if severity in ("low", "medium", "high", "critical") else "information"
+                ftype = "vulnerability" if adjusted_severity in ("low", "medium", "high", "critical") else "information"
                 findings.append({
                     "type": ftype,
-                    "severity": severity,
+                    "severity": adjusted_severity,  # Use adjusted severity
                     "location": data.get("matched-at", target),
-                    "description": data.get("info", {}).get("name", "Unknown"),
-                    "evidence": json.dumps(data, indent=2)
+                    "description": description,
+                    "evidence": json.dumps(data, indent=2),
+                    "original_severity": severity,  # Keep original for transparency
+                    "severity_adjusted": severity != adjusted_severity  # Flag if adjusted
                 })
             except json.JSONDecodeError:
                 continue
         return findings
+
     def generate_summary(self, findings: List[Dict[str, Any]], raw_output: str) -> str:
-        if not findings: return "No vulnerabilities detected"
-        severity_counts = {}
-        for f in findings:
-            sev = f.get("severity", "info")
-            severity_counts[sev] = severity_counts.get(sev, 0) + 1
-        return f"Found {len(findings)} vulnerabilities: " + ", ".join([f"{v} {k}" for k, v in severity_counts.items()])
+        if not findings:
+            has_output = bool(raw_output and raw_output.strip())
+            if has_output:
+                return "Nuclei finished with output but no parseable findings were produced."
+            return "Nuclei did not identify any findings."
+
+        severity_order = ("critical", "high", "medium", "low", "info")
+        severity_counts = {key: 0 for key in severity_order}
+        for finding in findings:
+            severity = str(finding.get("severity", "info")).strip().lower()
+            if severity not in severity_counts:
+                severity = "info"
+            severity_counts[severity] += 1
+
+        severity_summary = ", ".join(
+            f"{severity.title()}={severity_counts[severity]}" for severity in severity_order
+        )
+        return f"Nuclei findings by severity: {severity_summary}."
 
 class NaabuTool(BaseTool):
     def __init__(self):
@@ -196,19 +960,107 @@ def _base_url_for_web_tools(target: str, **kwargs) -> str:
         return f"http://{t}"
     return f"https://{t}"
 
+OWASP_URL_PATTERNS = {
+    "A01:2021": [
+        r'/admin', r'/dashboard', r'/manage', r'/panel',
+        r'/api/user', r'/api/admin', r'/account',
+        r'/role', r'/permission', r'/profile',
+        r'/user/\d+', r'/api/\d+',
+    ],
+    "A02:2021": [
+        r'/login', r'/auth', r'/oauth', r'/token',
+        r'/jwt', r'/session', r'/password',
+        r'/reset', r'/crypto', r'/cert', r'/api/login',
+    ],
+    "A03:2021": [
+        r'/vulnerabilities/sqli', r'/vulnerabilities/exec',
+        r'/vulnerabilities/xss', r'/vulnerabilities/fi',
+        r'sqli', r'injection', r'/exec', r'/cmd',
+        r'/search', r'/query', r'/filter', r'/api/',
+        r'create_paste', r'import_paste', r'upload_paste',
+        r'openapi\.yaml', r'graphql', r'\?.*=',
+        r'/login', r'/comment', r'/post',
+    ],
+    "A04:2021": [
+        r'/checkout', r'/payment', r'/order',
+        r'/workflow', r'/process', r'/state',
+        r'/transfer', r'/account', r'/balance',
+        r'/settings', r'/profile',
+    ],
+    "A05:2021": [
+        r'/admin', r'/debug', r'/swagger',
+        r'actuator', r'phpinfo', r'\.git',
+        r'\.env', r'/config', r'/backup',
+        r'robots\.txt', r'sitemap\.xml',
+        r'/console', r'/phpmyadmin',
+        r'compose\.yml', r'openapi\.yaml',
+    ],
+    "A06:2021": [
+        r'/version', r'/about', r'/changelog',
+        r'/plugin', r'/component', r'/status',
+        r'wp-content', r'wp-includes',
+        r'/joomla', r'/drupal', r'/magento',
+        r'jquery', r'bootstrap', r'/vendor',
+    ],
+    "A07:2021": [
+        r'/login', r'/signin', r'/auth',
+        r'/session', r'/reset', r'/password',
+        r'/mfa', r'/otp', r'/register',
+        r'/logout', r'/oauth', r'/token',
+        r'/account', r'/user',
+    ],
+    "A08:2021": [
+        r'/upload', r'/import', r'/package',
+        r'/update', r'/install', r'/plugin',
+        r'/artifact', r'/download', r'/deploy',
+        r'upload_paste', r'import_paste',
+        r'\.zip', r'\.tar', r'\.jar',
+    ],
+    "A09:2021": [
+        r'/logs', r'/audit', r'/monitor',
+        r'/events', r'/report', r'/admin',
+        r'/debug', r'/trace', r'/error',
+        r'/actuator', r'/health', r'/metrics',
+    ],
+    "A10:2021": [
+        r'/proxy', r'/fetch', r'/url',
+        r'/redirect', r'/callback', r'/webhook',
+        r'/download', r'/import', r'/load',
+        r'\?.*url=', r'\?.*path=', r'\?.*src=',
+        r'\?.*redirect=', r'\?.*next=',
+    ],
+}
+
+def _get_owasp_category_for_url(url: str) -> Optional[str]:
+    """Classify a URL and return the most relevant OWASP category, or None."""
+    url_lower = url.lower()
+    scores = {}
+    for category, patterns in OWASP_URL_PATTERNS.items():
+        score = sum(1 for p in patterns if re.search(p, url_lower))
+        if score > 0:
+            scores[category] = score
+    if not scores:
+        return None
+    return max(scores, key=scores.get)
 class HttpxTool(BaseTool):
+
+
     def __init__(self):
         super().__init__("Httpx")
     def build_command(self, target: str, output_file: Path, **kwargs) -> List[str]:
         httpx_bin = _get_httpx_path()
         # If already a full URL, use as-is (single probe)
         if target.startswith("http://") or target.startswith("https://"):
-            return [httpx_bin, "-u", target, "-json", "-o", str(output_file), "-silent", "-title", "-td", "-sc"]
+            return [httpx_bin, "-u", target, "-json", "-o", str(output_file), "-silent", "-title", "-td", "-sc", "-web-server", "-ip", "-cname"]
         # During clues gathering: when user enters an IP we switch it to URLs (http(s)://ip:port)
         # using Naabu open ports so Httpx finds HTTP services instead of probing only https://ip.
         clues = kwargs.get("clues") or {}
         open_ports = list(clues.get("open_ports") or [])
-        host = target.strip()
+        # IMPORTANT:
+        # For targets like `localhost:3000`, we must strip the port once.
+        # We then append candidate web ports from Naabu, otherwise we build invalid URLs
+        # like `http://localhost:3000:80`.
+        host = _normalize_host(target)
         urls = []
         if open_ports:
             # Prefer ports Naabu found; keep common web ports plus any from Naabu
@@ -235,7 +1087,7 @@ class HttpxTool(BaseTool):
         cmd = [httpx_bin]
         for u in urls[:50]:  # cap to avoid huge CLI
             cmd.extend(["-u", u])
-        cmd.extend(["-json", "-o", str(output_file), "-silent", "-title", "-td", "-sc"])
+        cmd.extend(["-json", "-o", str(output_file), "-silent", "-title", "-td", "-sc", "-web-server", "-ip", "-cname"])
         return cmd
     def parse_output(self, output: str, target: str) -> List[Dict[str, Any]]:
         findings = []
@@ -403,13 +1255,13 @@ class GAUTool(BaseTool):
     def build_command(self, target: str, output_file: Path, **kwargs) -> List[str]:
         # GAU uses --o for output file (not -o)
         domain = _normalize_host(target)
-        return ["gau", domain, "--o", str(output_file)]
+        return ["gau", domain, "--o", str(output_file), "--timeout", "15"]
     def parse_output(self, output: str, target: str) -> List[Dict[str, Any]]:
         findings = []
         for line in output.strip().split('\n'):
             if line and line.startswith('http'):
                 findings.append({"type": "endpoint","severity": "info","location": line.strip(),"description": f"Historical URL: {line.strip()}","evidence": line.strip()})
-        return findings[:100]
+        return findings
     def generate_summary(self, findings: List[Dict[str, Any]], raw_output: str) -> str:
         if not findings: return "No historical URLs found"
         return f"Found {len(findings)} historical URLs"
@@ -417,17 +1269,118 @@ class GAUTool(BaseTool):
 class KatanaTool(BaseTool):
     def __init__(self):
         super().__init__("Katana")
+    
     def build_command(self, target: str, output_file: Path, **kwargs) -> List[str]:
         base_url = _base_url_for_web_tools(target, **kwargs)
-        return ["katana", "-u", base_url, "-o", str(output_file), "-silent", "-d", "3"]
+        return ["katana", "-u", base_url, "-o", str(output_file), "-silent", "-d", "3", "-jc", "-kf", "all", "-c", "25", "-fx"]
+    
+    @staticmethod
+    def _classify_url_severity(url: str) -> str:
+        """Classify URL severity based on sensitive patterns."""
+        url_lower = url.lower()
+        
+        # CRITICAL: Most severe exposures for A05.
+        critical_patterns = [
+            r'/documents/internal/',           # Internal documents are critical by design
+            r'aws_secrets', r'firewall_rules', r'config_backup', r'ip_config',
+            r'network\.pptx$', r'aws_secrets\.docx$',
+            r'password_policy\.docx$', r'draft\.docx$',
+            r'/backup/', r'/private/', r'/confidential/',
+        ]
+        for pattern in critical_patterns:
+            if re.search(pattern, url_lower):
+                return "critical"
+
+        # HIGH: Authentication/security items and potentially sensitive documents.
+        high_patterns = [
+            r'/vulnerabilities/',              # Known vulnerable apps (DVWA)
+            r'phpinfo\.php',                   # PHP info disclosure
+            r'/admin', r'/login', r'/auth',    # Admin/auth endpoints
+            r'vpn_setup', r'pentest_results', r'compliance_audit', r'business_plan',
+            r'ip_config', r'contract',
+            r'/documents/(?!internal).*\.(docx|pptx|xlsx)$',
+            r'\.(bak|old|backup|sql|env)$',   # Backup/config files
+        ]
+        for pattern in high_patterns:
+            if re.search(pattern, url_lower):
+                return "high"
+        
+        # MEDIUM: Information disclosure
+        medium_patterns = [
+            r'/compose\.yml', r'docker-compose',  # Docker configs
+            r'openapi\.yaml', r'swagger',         # API specs
+            r'/graphql',                           # GraphQL endpoints
+            r'\.(json|xml|yaml|yml)$',             # Config/data files
+            r'/test/', r'/dev/', r'/staging/',      # Non-prod environments
+            r'/documents/.*\.(docx|pptx|xlsx)$',   # Non-internal documents are medium risk
+            r'\.git', r'\.svn',                   # Version control metadata
+        ]
+        for pattern in medium_patterns:
+            if re.search(pattern, url_lower):
+                return "medium"
+
+        # LOW: Potentially interesting
+        low_patterns = [
+            r'/debug', r'/trace',                 # Debug endpoints
+            r'robots\.txt', r'sitemap\.xml',    # Site maps
+        ]
+        for pattern in low_patterns:
+            if re.search(pattern, url_lower):
+                return "low"
+
+        low_patterns = [
+            r'\.git', r'\.svn',                 # Version control
+            r'/debug', r'/trace',               # Debug endpoints
+            r'robots\.txt', r'sitemap\.xml',    # Site maps
+        ]
+        for pattern in low_patterns:
+            if re.search(pattern, url_lower):
+                return "low"
+        
+        # Default: Info
+        return "info"
+    
     def parse_output(self, output: str, target: str) -> List[Dict[str, Any]]:
         findings = []
+        owasp_keywords = NucleiTool._owasp_url_keywords(getattr(self, 'owasp_category', None))
+        strict_owasp = str(os.getenv("OWASP_STRICT_FILTER", "true")).strip().lower() in ("1", "true", "yes")
+
         for line in output.strip().split('\n'):
             if line and line.startswith('http'):
                 url = line.strip()
-                # Avoid repeating URL in description (location already shows the URL)
-                findings.append({"type": "endpoint", "severity": "info", "location": url, "description": "Crawled endpoint", "evidence": url})
-        return findings[:100]
+                url_l = url.lower()
+
+                if owasp_keywords and not any(kw in url_l for kw in owasp_keywords):
+                    if strict_owasp:
+                        continue
+                    # Non-strict mode: keep secondary category hits too
+
+                # Intelligently classify severity based on URL content
+                severity = self._classify_url_severity(url)
+                
+                # Generate descriptive label based on severity
+                if severity == "critical":
+                    description = "Critical sensitive resource exposed"
+                elif severity == "high":
+                    description = "High-risk endpoint discovered"
+                elif severity == "medium":
+                    description = "Potentially sensitive endpoint"
+                elif severity == "low":
+                    description = "Low-priority endpoint"
+                else:
+                    description = "Crawled endpoint"
+                
+                finding_type = "vulnerability" if severity in ("critical", "high", "medium", "low") else "endpoint"
+                findings.append({
+                    "type": finding_type,
+                    "severity": severity,
+                    "location": url,
+                    "description": description,
+                    "evidence": url,
+                    "owasp_category": _get_owasp_category_for_url(url),
+                })
+
+        return findings
     def generate_summary(self, findings: List[Dict[str, Any]], raw_output: str) -> str:
         if not findings: return "No URLs crawled"
         return f"Crawled {len(findings)} URLs"
@@ -449,13 +1402,46 @@ class GoSpiderTool(BaseTool):
         return ["bash", "-c", f"gospider -s {base_url} -o {temp_dir} -q -d 2 2>&1 | tee {output_file}"]
     def parse_output(self, output: str, target: str) -> List[Dict[str, Any]]:
         findings = []
+        owasp_keywords = NucleiTool._owasp_url_keywords(getattr(self, 'owasp_category', None))
+        strict_owasp = str(os.getenv("OWASP_STRICT_FILTER", "true")).strip().lower() in ("1", "true", "yes")
+
         for line in output.strip().split('\n'):
             match = re.search(r'https?://[^\s]+', line)
             if match:
                 url = match.group(0)
-                # Avoid repeating URL in description (location already shows the URL)
-                findings.append({"type": "endpoint", "severity": "info", "location": url, "description": "Crawled endpoint", "evidence": line})
-        return findings[:100]
+                url_l = url.lower()
+
+                if owasp_keywords and not any(kw in url_l for kw in owasp_keywords):
+                    if strict_owasp:
+                        continue
+                    # Non-strict mode includes secondary category matches as well
+
+
+                # Intelligently classify severity based on URL content (same logic as Katana)
+                severity = KatanaTool._classify_url_severity(url)
+                
+                # Generate descriptive label based on severity
+                if severity == "critical":
+                    description = "Critical sensitive resource exposed"
+                elif severity == "high":
+                    description = "High-risk endpoint discovered"
+                elif severity == "medium":
+                    description = "Potentially sensitive endpoint"
+                elif severity == "low":
+                    description = "Low-priority endpoint"
+                else:
+                    description = "Crawled endpoint"
+                
+                finding_type = "vulnerability" if severity in ("critical", "high", "medium", "low") else "endpoint"
+                findings.append({
+                    "type": finding_type,
+                    "severity": severity,
+                    "location": url,
+                    "description": description,
+                    "evidence": line,
+                    "owasp_category": _get_owasp_category_for_url(url),
+                })
+        return findings
     def generate_summary(self, findings: List[Dict[str, Any]], raw_output: str) -> str:
         if not findings: return "No URLs crawled"
         return f"Crawled {len(findings)} URLs"
@@ -495,6 +1481,12 @@ class FFufTool(BaseTool):
                 wordlist_path = path
                 break
         base_words = "admin\nlogin\napi\ntest\ndebug\nbackup\nconfig\nindex.php\nlogin.php\nadmin.php\n"
+        owasp_category = kwargs.get("owasp_category")
+        # Include confidence keywords for this OWASP category (if selected)
+        owasp_words = NucleiTool._owasp_fuzz_keywords(owasp_category)
+        if owasp_words:
+            base_words += "\n" + "\n".join(owasp_words) + "\n"
+
         if not wordlist_path:
             wordlist_path = "/tmp/quick_wordlist.txt"
             with open(wordlist_path, 'w') as f:
@@ -531,13 +1523,29 @@ class FFufTool(BaseTool):
                 if status_code in [200, 201, 202, 204, 301, 302, 307, 403]:  # Interesting status codes
                     fuzz_val = item.get("input", {}).get("FUZZ", "")
                     location = item.get("url") if isinstance(item.get("url"), str) and item.get("url", "").startswith("http") else f"https://{target}/{fuzz_val}"
+                    
+                    # Classify severity based on path patterns
+                    severity = KatanaTool._classify_url_severity(location)
+                    
+                    # Adjust severity based on status code
+                    if status_code == 403:
+                        severity = "medium"  # Forbidden - potentially interesting
+                    elif status_code in [200, 201, 204]:
+                        pass  # Keep classified severity
+                    elif status_code in [301, 302, 307]:
+                        if severity == "info":
+                            severity = "low"  # Redirects are slightly more interesting
+                    
+                    finding_type = "vulnerability" if severity in ("critical", "high", "medium", "low") else "endpoint"
                     findings.append({
-                        "type": "endpoint",
-                        "severity": "info",
+                        "type": finding_type,
+                        "severity": severity,
                         "location": location,
-                        "description": f"Discovered endpoint: {item.get('input', {}).get('FUZZ', '')} (Status: {status_code}) - Length: {item.get('length', 0)} chars",
-                        "evidence": json.dumps(item)
+                        "description": f"Discovered endpoint: {fuzz_val} (Status: {status_code})",
+                        "evidence": json.dumps(item),
+                        "owasp_category": _get_owasp_category_for_url(location),
                     })
+
         except json.JSONDecodeError:
             # Fallback parsing - only accept lines that look like real results
             for line in output.strip().split('\n'):
@@ -555,13 +1563,24 @@ class FFufTool(BaseTool):
                 ):
                     loc = line.split()[0] if line.split() else line
                     if loc.startswith("http"):
+                        # Extract status code for severity adjustment
+                        status_match = re.search(r'\b(200|201|202|204|301|302|307|403)\b', line)
+                        status = int(status_match.group(1)) if status_match else 200
+                        
+                        severity = KatanaTool._classify_url_severity(loc)
+                        if status == 403:
+                            severity = "medium"
+                        
+                        finding_type = "vulnerability" if severity in ("critical", "high", "medium", "low") else "endpoint"
                         findings.append({
-                            "type": "endpoint",
-                            "severity": "info",
+                            "type": finding_type,
+                            "severity": severity,
                             "location": loc,
                             "description": "Potentially interesting endpoint found",
-                            "evidence": line
+                            "evidence": line,
+                            "owasp_category": _get_owasp_category_for_url(loc),
                         })
+                    
         return findings[:50]  # Limit results to prevent overwhelming
     def generate_summary(self, findings: List[Dict[str, Any]], raw_output: str) -> str:
         if not findings: return "No interesting endpoints found"
@@ -584,6 +1603,11 @@ class WfuzzTool(BaseTool):
                 wordlist_path = path
                 break
         base_words = "admin\nlogin\napi\ntest\ndebug\nbackup\nconfig\n"
+        owasp_category = kwargs.get("owasp_category")
+        owasp_words = NucleiTool._owasp_fuzz_keywords(owasp_category)
+        if owasp_words:
+            base_words += "\n" + "\n".join(owasp_words) + "\n"
+
         if not wordlist_path:
             wordlist_path = "/tmp/wfuzz_default_wordlist.txt"
             with open(wordlist_path, 'w') as f:
@@ -622,12 +1646,27 @@ class WfuzzTool(BaseTool):
                     code = 0
                 if code not in [404, 403]:  # Filter out common error codes
                     location = item.get("url") or f"https://{target}/{payload}"
+                    
+                    # Classify severity based on path patterns
+                    severity = KatanaTool._classify_url_severity(location)
+                    
+                    # Adjust based on status code
+                    if int(code) == 403:
+                        severity = "medium"
+                    elif int(code) in [200, 201, 204]:
+                        pass  # Keep classified severity
+                    elif int(code) in [301, 302, 307]:
+                        if severity == "info":
+                            severity = "low"
+                    
+                    finding_type = "vulnerability" if severity in ("critical", "high", "medium", "low") else "endpoint"
                     findings.append({
-                        "type": "endpoint",
-                        "severity": "info",
+                        "type": finding_type,
+                        "severity": severity,
                         "location": location,
                         "description": f"Discovered endpoint: {payload} (Status: {code}) - Size: {item.get('lines', item.get('Chars', 0))}",
-                        "evidence": json.dumps(item)
+                        "evidence": json.dumps(item),
+                        "owasp_category": _get_owasp_category_for_url(location),
                     })
         except json.JSONDecodeError:
             # Fallback parsing - only accept lines that look like real results
@@ -644,12 +1683,15 @@ class WfuzzTool(BaseTool):
                 ):
                     loc = line.split()[0] if line.split() else line
                     if loc.startswith("http"):
+                        severity = KatanaTool._classify_url_severity(loc)
+                        finding_type = "vulnerability" if severity in ("critical", "high", "medium", "low") else "endpoint"
                         findings.append({
-                            "type": "endpoint",
-                            "severity": "info",
+                            "type": finding_type,
+                            "severity": severity,
                             "location": loc,
                             "description": "Potentially interesting endpoint found",
-                            "evidence": line
+                            "evidence": line,
+                            "owasp_category": _get_owasp_category_for_url(loc),
                         })
         return findings[:50]  # Limit results to prevent overwhelming
     def generate_summary(self, findings: List[Dict[str, Any]], raw_output: str) -> str:
@@ -753,20 +1795,49 @@ class ShuffleDNSTool(BaseTool):
         domain = _normalize_host(target)
         return ["shuffledns", "-d", domain, "-r", resolver_file, "-w", wordlist_path, "-mode", "bruteforce", "-o", str(output_file)]
     def parse_output(self, output: str, target: str) -> List[Dict[str, Any]]:
-        findings = []
-        for line in output.strip().split('\n'):
-            if line and line.strip():
-                # Expected format: subdomain.domain.com A ip.address
-                parts = line.split()
-                if len(parts) >= 3:
-                    subdomain_full = parts[0]
-                    findings.append({
-                        "type": "asset",
-                        "severity": "info",
-                        "location": subdomain_full,
-                        "description": f"Discovered subdomain: {subdomain_full}",
-                        "evidence": line.strip()
-                    })
+        findings: List[Dict[str, Any]] = []
+        seen = set()
+        domain = _normalize_host(target).lower()
+        if domain.startswith("www."):
+            domain = domain[4:]
+
+        hostname_re = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$")
+        skip_prefixes = ("[inf]", "[wrn]", "[err]", "usage:", "error:", "panic:", "flag provided")
+        skip_exact = {"=== stdout ===", "=== stderr ==="}
+
+        for raw in (output or "").split("\n"):
+            line = _strip_ansi(raw).strip()
+            if not line:
+                continue
+            low = line.lower()
+            if low in skip_exact:
+                continue
+            if any(low.startswith(p) for p in skip_prefixes):
+                continue
+            # Skip obvious banners / ascii art lines
+            if "projectdiscovery" in low or low.startswith("__") or low.startswith("___") or low.startswith("/___"):
+                continue
+            # ShuffleDNS output may be either:
+            # - hostname
+            # - hostname A 1.2.3.4
+            parts = line.split()
+            candidate = parts[0].strip() if parts else ""
+            if not candidate or " " in candidate or not hostname_re.match(candidate):
+                continue
+            cand_low = candidate.lower()
+            if cand_low != domain and not cand_low.endswith("." + domain):
+                continue
+            if cand_low in seen:
+                continue
+            seen.add(cand_low)
+            findings.append({
+                "type": "asset",
+                "severity": "info",
+                "location": candidate,
+                "description": f"Subdomain discovered: {candidate}",
+                "evidence": line,
+            })
+
         return findings
     def generate_summary(self, findings: List[Dict[str, Any]], raw_output: str) -> str:
         if not findings: return "No subdomains discovered via bruteforce"

@@ -5,18 +5,21 @@ import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+from urllib.parse import urlparse
 from sqlalchemy import select, func, desc, case
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.scan import Scan, ScanStatus
 from app.models.tool_run import ToolRun, ToolRunStatus
-from app.models.finding import Finding, FindingSeverity
+from app.models.finding import Finding, FindingSeverity, FindingType
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.tools.executor import execute_tool
+from app.ai.decision_node import SAFE_FALLBACK_TOOLS, decide_tools
 from app.core.ws_updates import init_websocket_manager
-from app.ai.decision_node import decide_tools
 from app.ai.validation import validate_ai_plan_and_execution
 from app.core.validation import validate_domain
+
+AI_FALLBACK_MARKER = "AI_FALLBACK_MODE_ACTIVE"
 
 logger = get_logger(__name__)
 
@@ -41,6 +44,142 @@ class ScanService:
 
     # Scans in CREATING/PREPARING/RUNNING older than this are treated as stuck and do not block new scans.
     STALE_RUNNING_THRESHOLD_MINUTES = 30
+
+    # Passive/DNS-oriented tools can return irrelevant wildcard-like results
+    # when the target is localhost / loopback. Skip them for accuracy.
+    _LOCAL_DNS_TOOLS = {
+        "Subfinder",
+        "Amass",
+        "Assetfinder",
+        "Sublist3r",
+        "DNSx",
+        "ShuffleDNS",
+    }
+
+    @staticmethod
+    def _is_local_target(target: str) -> bool:
+        """Return True if target is localhost/loopback (including host:port)."""
+        t = (target or "").strip().lower()
+        if not t:
+            return False
+        # Strip protocol if present
+        if t.startswith(("http://", "https://")):
+            parsed = urlparse(t)
+            t = (parsed.hostname or "").strip().lower()
+        else:
+            # If host:port, strip port (ignore IPv6 for now)
+            if ":" in t and not t.startswith("[") and not t.count(":") > 1:
+                t = t.split(":", 1)[0].strip().lower()
+            # If bracketed IPv6: [::1]
+            if t.startswith("[") and t.endswith("]"):
+                t = t.strip("[]")
+
+        return t in {"localhost", "127.0.0.1", "::1"} or t.endswith(".localhost")
+
+    @staticmethod
+    def _normalize_finding_classification(
+        raw_type: Optional[str],
+        raw_severity: Optional[str],
+        raw_owasp_category: Optional[str],
+    ) -> Dict[str, Optional[str]]:
+        """Normalize finding type/severity/owasp to prevent recon misclassification.
+
+        Rules:
+        - Recon/discovery finding types (asset/endpoint/port/information) are always INFO
+          and must not carry OWASP vulnerability category.
+        - Only vulnerability/misconfiguration findings may keep low/medium/high/critical and OWASP category.
+        """
+        type_map = {
+            "asset": "asset",
+            "endpoint": "endpoint",
+            "port": "port",
+            "vulnerability": "vulnerability",
+            "misconfiguration": "misconfiguration",
+            "information": "information",
+            "info": "information",
+        }
+        sev_map = {
+            "critical": "critical",
+            "high": "high",
+            "medium": "medium",
+            "low": "low",
+            "info": "info",
+        }
+
+        ftype = type_map.get((raw_type or "information").lower(), "information")
+        fsev = sev_map.get((raw_severity or "info").lower(), "info")
+        owasp_category = raw_owasp_category
+        
+        # Strict guard: non-vulnerability findings should never be elevated severity.
+        # EXCEPTION: endpoint findings can retain their severity if they represent sensitive resource exposure
+        # (e.g., Katana/GoSpider discovering aws_secrets.docx, /admin panels, etc.)
+        if ftype not in {"vulnerability", "misconfiguration"}:
+            # Allow endpoint findings to keep their classified severity (from intelligent URL analysis)
+            # Only force to info for pure reconnaissance types (assets, ports, information)
+            if ftype in ("asset", "port", "information"):
+                fsev = "info"
+                owasp_category = None
+
+        return {"type": ftype, "severity": fsev, "owasp_category": owasp_category}
+
+    @staticmethod
+    def _scan_has_owasp_focus(owasp_category: Optional[str]) -> bool:
+        """True when the user picked an OWASP Top 10 category (A01–A10 style)."""
+        if not owasp_category:
+            return False
+        o = str(owasp_category).strip().upper()
+        return o.startswith("A") and ":2021" in o
+
+    @staticmethod
+    def _apply_owasp_scope_to_normalized(
+        scan_owasp_category: Optional[str],
+        normalized: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """When a scan is OWASP-focused, drop recon-only rows and align vuln/misconfig OWASP labels.
+
+        Returns normalized dict to persist, or None to skip this finding entirely.
+        """
+        if not ScanService._scan_has_owasp_focus(scan_owasp_category):
+            return normalized
+        scan_o = str(scan_owasp_category).strip().upper()
+        ftype = normalized.get("type")
+        if hasattr(ftype, "value"):
+            ftype = ftype.value
+        ftype = (ftype or "information").lower()
+
+        # Keep reconnaissance findings (ports, assets) but set them to info severity without OWASP category
+        # EXCEPTION: endpoint findings from crawlers (Katana/GoSpider/FFuf/Wfuzz) can retain their classified severity
+        # because they represent actual sensitive resource exposure (e.g., aws_secrets.docx, /admin, DVWA paths)
+        if ftype in ("asset", "port", "information"):
+            # Pure reconnaissance - force to info severity
+            result = {**normalized, "severity": "info", "owasp_category": None}
+            return result
+
+        # For endpoint/vulnerability/misconfiguration findings, strict OWASP filter behavior:
+        # - if declared category does not match selected scan category, keep as discovered finding
+        #   (do not silently downgrade to info/endpoint); preserve severity classification.
+        # - if matches, keep classification and align category.
+        if ftype in ("endpoint", "vulnerability", "misconfiguration"):
+            detected_owasp = normalized.get("owasp_category")
+            if hasattr(detected_owasp, "value"):
+                detected_owasp = detected_owasp.value
+            detected_owasp = (detected_owasp or "").strip().upper()
+
+            if detected_owasp != scan_o:
+                # Keep finding but remove strict scope label; this prevents missed vulnerabilities
+                # while still distinguishing scanned category context.
+                return {**normalized, "owasp_category": None}
+
+            return {**normalized, "owasp_category": scan_o}
+
+        # Anything else (unlikely) can be scoped normally.
+        ow = normalized.get("owasp_category")
+        if ow:
+            if str(ow).strip().upper() != scan_o:
+                return None
+        else:
+            normalized = {**normalized, "owasp_category": scan_o}
+        return normalized
 
     @staticmethod
     async def has_running_scan(db: AsyncSession) -> bool:
@@ -220,6 +359,23 @@ class ScanService:
                     t for t in selected_tools if t in valid_tools
                 ]
 
+                # Scheduled scans: for localhost/loopback, skip passive/DNS tools
+                # to avoid irrelevant wildcard-like results.
+                skipped_local: List[Dict[str, str]] = []
+                if ScanService._is_local_target(target):
+                    removed_local = [t for t in normalized_tools_to_run if t in ScanService._LOCAL_DNS_TOOLS]
+                    if removed_local:
+                        normalized_tools_to_run = [
+                            t for t in normalized_tools_to_run if t not in ScanService._LOCAL_DNS_TOOLS
+                        ]
+                        skipped_local = [
+                            {
+                                "tool": t,
+                                "reason": "Local/loopback target: skipping passive/DNS subdomain enumeration to avoid irrelevant results.",
+                            }
+                            for t in removed_local
+                        ]
+
                 # ----- SCHEDULED SCAN FLOW (not dashboard): no clues, no AI; run chosen tools only -----
                 if scheduled_scan_id is not None:
                     logger.info(
@@ -241,7 +397,7 @@ class ScanService:
                     result = await db.execute(select(Scan).where(Scan.id == scan_id))
                     scan = result.scalar_one()
                     scan.ai_tools_to_run = json.dumps(normalized_tools_to_run)
-                    scan.ai_tools_skipped = json.dumps([])
+                    scan.ai_tools_skipped = json.dumps(skipped_local)
                     scan.ai_raw_response = None
                     await db.commit()
                 else:
@@ -271,7 +427,9 @@ class ScanService:
                     except ImportError:
                         pass
 
-                    clues = await ScanService._gather_initial_clues(scan_id, target, db)
+                    clues = await ScanService._gather_initial_clues(
+                        scan_id, target, db, owasp_category=owasp_category
+                    )
 
                     result = await db.execute(select(Scan).where(Scan.id == scan_id))
                     scan = result.scalar_one()
@@ -336,7 +494,7 @@ class ScanService:
                             exc_info=True,
                         )
                         safe_tools = [
-                            t for t in selected_tools if t in settings.AVAILABLE_TOOLS
+                            t for t in SAFE_FALLBACK_TOOLS if t in settings.AVAILABLE_TOOLS
                         ]
                         result = await db.execute(select(Scan).where(Scan.id == scan_id))
                         scan = result.scalar_one()
@@ -344,7 +502,7 @@ class ScanService:
                         scan.ai_tools_skipped = json.dumps([])
                         scan.ai_raw_response = None
                         scan.error_summary = (
-                            f"AI Decision error, falling back to user tools: {str(e)}"
+                            f"AI decision fallback active: {str(e)}. {AI_FALLBACK_MARKER}"
                         )
                         await db.commit()
 
@@ -366,15 +524,55 @@ class ScanService:
                             t for t in selected_tools if t in valid_tools
                         ]
 
+                    # Naabu + Httpx are always executed once in the initial clues phase for dashboard scans.
+                    # Ensure AI does not schedule them again in the main tool execution phase.
+                    clue_tools = {"Naabu", "Httpx"}
+                    removed_clue_tools = [t for t in normalized_tools_to_run if t in clue_tools]
+                    if removed_clue_tools:
+                        normalized_tools_to_run = [t for t in normalized_tools_to_run if t not in clue_tools]
+
+                    # If local/loopback target, remove passive/DNS tools for accuracy.
+                    skipped_local: List[Dict[str, str]] = []
+                    if ScanService._is_local_target(target):
+                        removed_local = [
+                            t
+                            for t in normalized_tools_to_run
+                            if t in ScanService._LOCAL_DNS_TOOLS
+                        ]
+                        if removed_local:
+                            normalized_tools_to_run = [
+                                t
+                                for t in normalized_tools_to_run
+                                if t not in ScanService._LOCAL_DNS_TOOLS
+                            ]
+                            skipped_local = [
+                                {
+                                    "tool": t,
+                                    "reason": "Local/loopback target: skipping passive/DNS subdomain enumeration to avoid irrelevant results.",
+                                }
+                                for t in removed_local
+                            ]
+
                     result = await db.execute(select(Scan).where(Scan.id == scan_id))
                     scan = result.scalar_one()
                     scan.ai_tools_to_run = json.dumps(normalized_tools_to_run)
-                    scan.ai_tools_skipped = json.dumps(
-                        ai_decision.tools_skipped or []
-                    )
+                    # Preserve AI skipped tools but also record clue tools removed to avoid duplicate execution.
+                    skipped = list(ai_decision.tools_skipped or [])
+                    for t in removed_clue_tools:
+                        skipped.append({
+                            "tool": t,
+                            "reason": "Already executed in initial clues phase (runs once per scan)."
+                        })
+                    for entry in skipped_local:
+                        skipped.append(entry)
+                    scan.ai_tools_skipped = json.dumps(skipped)
                     scan.ai_raw_response = getattr(
                         ai_decision, "raw_response", None
                     )
+
+                    if not getattr(ai_decision, "success", True):
+                        if AI_FALLBACK_MARKER not in (scan.error_summary or ""):
+                            scan.error_summary = (scan.error_summary or "") + " " + AI_FALLBACK_MARKER
 
                     messages: List[str] = []
                     if not getattr(ai_decision, "success", True):
@@ -431,10 +629,103 @@ class ScanService:
                     pass
                 
                 await ScanService._execute_tools(
-                    db, scan_id, target, normalized_tools_to_run, clues=clues
+                    db,
+                    scan_id,
+                    target,
+                    normalized_tools_to_run,
+                    clues=clues,
+                    owasp_category=scan.owasp_category,
                 )
 
-                # Phase 5: Finalize scan (includes AI validation)
+                # PHASE 2: Intelligence Layer - Classify endpoints and tag risk
+                logger.info(f"Scan {scan_id}: Intelligence Layer - classifying endpoints")
+                try:
+                    from app.core.ws_updates import send_scan_phase_update, send_log_message
+                    await send_log_message(scan_id, "System", "Analyzing discovered endpoints and classifying by type/risk...")
+                    await send_scan_phase_update(scan_id, "intelligence_layer", {
+                        "currentPhase": "intelligence_layer",
+                        "phase": "Intelligence Layer",
+                        "description": "Classifying endpoints and tagging risk levels"
+                    })
+                except ImportError:
+                    pass
+
+                endpoint_classification = await ScanService._run_intelligence_layer(
+                    db, scan_id, target, owasp_category, clues
+                )
+
+                # PHASE 4: Active Testing Engine - Custom HTTP requests
+                logger.info(f"Scan {scan_id}: Active Testing Engine")
+                try:
+                    from app.core.ws_updates import send_scan_phase_update, send_log_message
+                    await send_log_message(scan_id, "System", f"Running active testing for OWASP {owasp_category}...")
+                    await send_scan_phase_update(scan_id, "active_testing", {
+                        "currentPhase": "active_testing",
+                        "phase": "Active Testing",
+                        "description": f"Custom HTTP requests for {owasp_category}"
+                    })
+                except ImportError:
+                    pass
+
+                active_test_results = await ScanService._run_active_testing(
+                    db,
+                    scan_id,
+                    target,
+                    owasp_category,
+                    endpoint_classification,
+                    clues=clues,
+                )
+
+                # PHASE 5: Response Analysis - Analyze active test responses
+                logger.info(f"Scan {scan_id}: Response Analysis")
+                try:
+                    from app.core.ws_updates import send_scan_phase_update, send_log_message
+                    await send_log_message(scan_id, "System", "Analyzing responses for vulnerability indicators...")
+                    await send_scan_phase_update(scan_id, "response_analysis", {
+                        "currentPhase": "response_analysis",
+                        "phase": "Response Analysis",
+                        "description": "Parsing responses for vulnerability indicators"
+                    })
+                except ImportError:
+                    pass
+
+                vulnerability_findings = await ScanService._run_response_analysis(
+                    db, scan_id, target, owasp_category, active_test_results
+                )
+
+                # PHASE 6: Correlation - Combine all results
+                logger.info(f"Scan {scan_id}: Correlation")
+                try:
+                    from app.core.ws_updates import send_scan_phase_update, send_log_message
+                    await send_log_message(scan_id, "System", "Correlating findings across all tools...")
+                    await send_scan_phase_update(scan_id, "correlation", {
+                        "currentPhase": "correlation",
+                        "phase": "Correlation",
+                        "description": "Combining results from all tools and active testing"
+                    })
+                except ImportError:
+                    pass
+
+                await ScanService._run_correlation(
+                    db, scan_id, target, owasp_category, endpoint_classification
+                )
+
+                # PHASE 7: Smart Risk Scoring - Adjust severity based on verified exploits
+                logger.info(f"Scan {scan_id}: Smart Risk Scoring")
+                try:
+                    from app.core.ws_updates import send_scan_phase_update, send_log_message
+                    await send_log_message(scan_id, "System", "Applying smart risk scoring based on verified exploits...")
+                    await send_scan_phase_update(scan_id, "risk_scoring", {
+                        "currentPhase": "risk_scoring",
+                        "phase": "Risk Scoring",
+                        "description": "Adjusting severity based on exploit verification"
+                    })
+                except ImportError:
+                    pass
+
+                await ScanService._run_smart_risk_scoring(db, scan_id, owasp_category)
+
+                # Phase 8: Finalize scan (includes AI validation)
                 logger.info(f"Scan {scan_id}: Finalizing")
                 await ScanService._finalize_scan(db, scan_id)
 
@@ -455,7 +746,10 @@ class ScanService:
 
     @staticmethod
     async def _gather_initial_clues(
-        scan_id: int, target: str, db: AsyncSession
+        scan_id: int,
+        target: str,
+        db: AsyncSession,
+        owasp_category: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run initial clues tools and gather reconnaissance data.
 
@@ -475,6 +769,11 @@ class ScanService:
             "status_codes": [],
             "technologies": [],
         }
+        
+        # If target is already a URL, add it as a known HTTP service immediately
+        # This prevents "HTTP services: 0" misleading message when user scans a URL directly
+        if target.startswith("http://") or target.startswith("https://"):
+            clues["http_services"].append(target)
 
         # Run Naabu (port scan)
         try:
@@ -482,20 +781,25 @@ class ScanService:
                 "Naabu", target, scan_id, timeout=120
             )
             if naabu_result.success:
-                # Save findings to database
+                # Always save reconnaissance findings from initial clues (they're info severity)
+                # These provide valuable context even in OWASP-focused scans
                 for finding_data in naabu_result.findings:
                     desc = finding_data.get("description", "")
-                    # Dedupe accidental description duplication at source
                     if desc and len(desc) >= 4:
                         half = len(desc) // 2
                         if desc[:half] == desc[half:]:
                             desc = desc[:half]
+                    normalized = ScanService._normalize_finding_classification(
+                        raw_type=finding_data.get("type", "port"),
+                        raw_severity=finding_data.get("severity", "info"),
+                        raw_owasp_category=None,
+                    )
                     finding = Finding(
                         scan_id=scan_id,
                         tool_name="Naabu",
-                        type=finding_data.get("type", "port"),
-                        severity=finding_data.get("severity", "info"),
-                        owasp_category=None,
+                        type=normalized["type"],
+                        severity=normalized["severity"],
+                        owasp_category=normalized["owasp_category"],
                         location=finding_data.get("location", ""),
                         description=desc,
                         evidence=finding_data.get("evidence"),
@@ -516,19 +820,25 @@ class ScanService:
                 "Httpx", target, scan_id, timeout=120, clues=clues
             )
             if httpx_result.success:
-                # Save findings to database
+                # Always save reconnaissance findings from initial clues (they're info severity)
+                # These provide valuable context even in OWASP-focused scans
                 for finding_data in httpx_result.findings:
                     desc = finding_data.get("description", "")
                     if desc and len(desc) >= 4:
                         half = len(desc) // 2
                         if desc[:half] == desc[half:]:
                             desc = desc[:half]
+                    normalized = ScanService._normalize_finding_classification(
+                        raw_type=finding_data.get("type", "endpoint"),
+                        raw_severity=finding_data.get("severity", "info"),
+                        raw_owasp_category=None,
+                    )
                     finding = Finding(
                         scan_id=scan_id,
                         tool_name="Httpx",
-                        type=finding_data.get("type", "endpoint"),
-                        severity=finding_data.get("severity", "info"),
-                        owasp_category=None,
+                        type=normalized["type"],
+                        severity=normalized["severity"],
+                        owasp_category=normalized["owasp_category"],
                         location=finding_data.get("location", ""),
                         description=desc,
                         evidence=finding_data.get("evidence"),
@@ -588,6 +898,7 @@ class ScanService:
         target: str,
         tool_names: List[str],
         clues: Optional[Dict[str, Any]] = None,
+        owasp_category: Optional[str] = None,
     ) -> None:
         """Execute tools in phases: discovery first (to collect URLs), then exploit.
 
@@ -609,11 +920,125 @@ class ScanService:
             u for u in (clues.get("http_services") or [])
             if u and (str(u).startswith("http://") or str(u).startswith("https://"))
         ))
-        discovered_urls.extend([f"https://{target}", f"http://{target}"])
+        # Reduce noisy TLS failures for local targets (we typically only have HTTP here).
+        if ScanService._is_local_target(target):
+            discovered_urls.extend([f"http://{target}"])
+        else:
+            discovered_urls.extend([f"https://{target}", f"http://{target}"])
         discovered_urls = list(dict.fromkeys(discovered_urls))
+
+        # OWASP endpoint enrichment:
+        # Feed Nuclei additional "likely" endpoints so it has something concrete to test
+        # even when crawling doesn't extract paths.
+        #
+        # To avoid hampering other scans (extra noise / longer runtimes), we only enrich
+        # when we currently have a small URL set (usually base URL + a few clue URLs).
+        if target and owasp_category and owasp_category.startswith("A"):
+            # If we already have many endpoints from Httpx/crawlers, avoid adding more.
+            if len(discovered_urls) <= 6:
+                local = ScanService._is_local_target(target)
+
+                # Balanced, low-noise endpoint lists (paths only; no query strings/payloads).
+                category_to_paths = {
+                    "A01:2021": [
+                        "/admin",
+                        "/dashboard",
+                        "/roles",
+                        "/permissions",
+                        "/account",
+                        "/api/roles",
+                    ],
+                    "A02:2021": [
+                        "/api/login",
+                        "/password-reset",
+                        "/oauth/token",
+                        "/auth/callback",
+                    ],
+                    "A03:2021": [
+                        "/search",
+                        "/query",
+                        "/api/search",
+                        "/product",
+                    ],
+                    "A04:2021": [
+                        "/profile",
+                        "/settings",
+                        "/account",
+                        "/api/account",
+                    ],
+                    "A05:2021": [
+                        "/swagger",
+                        "/swagger-ui",
+                        "/robots.txt",
+                        "/actuator/health",
+                    ],
+                    "A06:2021": [
+                        "/version",
+                        "/api/version",
+                        "/robots.txt",
+                        "/.well-known/security.txt",
+                    ],
+                    "A07:2021": [
+                        # Juice Shop (auth)
+                        "/rest/user/login",
+                        "/rest/user/logout",
+                        # Generic auth routes
+                        "/login",
+                        "/signin",
+                        "/auth/login",
+                        "/account/login",
+                    ],
+                    "A08:2021": [
+                        "/upload",
+                        "/uploads",
+                        "/download",
+                        "/api/upload",
+                    ],
+                    "A09:2021": [
+                        "/logs",
+                        "/admin/logs",
+                        "/monitoring",
+                        "/api/logs",
+                    ],
+                    "A10:2021": [
+                        "/proxy",
+                        "/fetch",
+                        "/download",
+                        "/api/proxy",
+                    ],
+                }
+
+                endpoint_paths = category_to_paths.get(owasp_category, [])
+                if endpoint_paths:
+                    # Avoid https:// enrichment for local targets (TLS negotiation can fail).
+                    schemes = ["http"] if local else ["https", "http"]
+                    for scheme in schemes:
+                        for p in endpoint_paths:
+                            discovered_urls.append(f"{scheme}://{target}{p}")
+                    discovered_urls = list(dict.fromkeys(discovered_urls))
+
+        # For local host:port scans (e.g. localhost:3000), keep Nuclei focused on the selected
+        # application port to avoid long hangs on unrelated local services (e.g. :631, :8081).
+        if ScanService._is_local_target(target) and ":" in str(target):
+            try:
+                target_port = str(target).rsplit(":", 1)[1].strip()
+                filtered_urls: List[str] = []
+                for u in discovered_urls:
+                    pu = urlparse(str(u))
+                    p = pu.port
+                    # Keep explicit target port URLs and plain host URLs without explicit port.
+                    if p is None or str(p) == target_port:
+                        filtered_urls.append(u)
+                # Never drop everything; fallback to original set if filter became empty.
+                discovered_urls = filtered_urls or discovered_urls
+            except Exception:
+                pass
         logger.info(f"Initial discovered_urls: {len(discovered_urls)} from clues")
 
         async def execute_one_tool(tool_name: str):
+            # Initialize counter for findings added (must be defined before any try/except blocks)
+            findings_added = 0
+            
             # Get tool run record
             result = await db.execute(
                 select(ToolRun).where(
@@ -660,70 +1085,129 @@ class ScanService:
 
             # Execute tool - pass discovered_urls and clues for exploit tools
             is_exploit = tool_name in settings.EXPLOIT_TOOLS
+            logger.info(f"EXECUTE_TOOL CALL: tool_name={tool_name}, is_exploit={is_exploit}, discovered_urls_count={len(discovered_urls) if discovered_urls else 0}, owasp_category={owasp_category}")
             tool_result = await execute_tool(
                 tool_name, target, scan_id,
                 discovered_urls=discovered_urls if is_exploit else None,
                 clues=clues if is_exploit else None,
+                owasp_category=owasp_category,
             )
 
             # Update tool run
             tool_run.finished_at = datetime.utcnow()
+            tool_run.summary = tool_result.summary
+            tool_run.raw_output_path = str(
+                settings.SCANS_DIR
+                / str(scan_id)
+                / f"{tool_name.lower()}.out"
+            )
 
-            if tool_result.success:
-                tool_run.status = ToolRunStatus.COMPLETED
-                tool_run.summary = tool_result.summary
-                tool_run.raw_output_path = str(
-                    settings.SCANS_DIR
-                    / str(scan_id)
-                    / f"{tool_name.lower()}.out"
-                )
+            async def persist_tool_findings(findings_list):
+                nonlocal discovered_urls
+                findings_added = 0
 
-                # Save findings - skip duplicates (same tool+location already from clues)
+                if not findings_list:
+                    return findings_added
+
+                from app.utils.finding_filters import extract_host_port
+
                 existing = await db.execute(
-                    select(Finding.tool_name, Finding.location)
+                    select(Finding.tool_name, Finding.location, Finding.evidence)
                     .where(Finding.scan_id == scan_id)
                 )
-                existing_pairs = {(r.tool_name, r.location) for r in existing.all()}
-                for finding_data in tool_result.findings:
+                existing_keys = set()
+                for r in existing.all():
+                    if (r.tool_name or "").lower() == "nuclei":
+                        host, port = extract_host_port(r.location)
+                        template_id = None
+                        if r.evidence:
+                            try:
+                                evidence_data = json.loads(r.evidence)
+                                template_id = evidence_data.get("template-id") or evidence_data.get("template_id")
+                            except Exception:
+                                pass
+                        key = (r.tool_name, host, port, template_id) if template_id else (r.tool_name, host, port)
+                    else:
+                        key = (r.tool_name, (r.location or "").strip())
+                    existing_keys.add(key)
+
+                logger.info(f"Tool {tool_name} has {len(findings_list)} raw findings, {len(existing_keys)} already exist in DB")
+
+                for finding_data in findings_list:
                     loc = (finding_data.get("location") or "").strip()
                     if not loc:
                         loc = "(no location)"
                     desc = (finding_data.get("description") or "").strip() or "No description"
-                    # Don't save Sublist3r banner/log lines as findings (only real subdomains)
+
+                    if tool_name in settings.DISCOVERY_TOOLS:
+                        url = ScanService._extract_urls_from_finding(loc, target)
+                        if url and url not in discovered_urls:
+                            discovered_urls.append(url)
+
+                    host, port = extract_host_port(loc)
+
+                    template_id = None
+                    if tool_name == "Nuclei" and finding_data.get("evidence"):
+                        try:
+                            evidence_data = json.loads(finding_data.get("evidence"))
+                            template_id = evidence_data.get("template-id") or evidence_data.get("template_id")
+                        except Exception:
+                            pass
+
                     if tool_name == "Sublist3r":
                         from app.utils.finding_filters import is_sublist3r_noise
                         if is_sublist3r_noise(loc, desc):
                             continue
-                    if (tool_name, loc) in existing_pairs:
+
+                    if tool_name.lower() == "nuclei":
+                        dedup_key = (tool_name, host, port, template_id) if template_id else (tool_name, host, port)
+                    else:
+                        dedup_key = (tool_name, loc)
+                    if dedup_key in existing_keys:
                         continue
-                    existing_pairs.add((tool_name, loc))
+                    existing_keys.add(dedup_key)
                     if desc and len(desc) >= 4:
                         half = len(desc) // 2
                         if desc[:half] == desc[half:]:
                             desc = desc[:half]
-                    # Normalize type/severity to valid enum values
-                    raw_type = (finding_data.get("type") or "information").lower()
-                    raw_severity = (finding_data.get("severity") or "info").lower()
-                    type_map = {"asset": "asset", "endpoint": "endpoint", "port": "port", "vulnerability": "vulnerability", "misconfiguration": "misconfiguration", "information": "information", "info": "information"}
-                    sev_map = {"critical": "critical", "high": "high", "medium": "medium", "low": "low", "info": "info"}
-                    ftype = type_map.get(raw_type, "information")
-                    fsev = sev_map.get(raw_severity, "info")
+                    normalized = ScanService._normalize_finding_classification(
+                        raw_type=finding_data.get("type"),
+                        raw_severity=finding_data.get("severity"),
+                        raw_owasp_category=finding_data.get("owasp_category"),
+                    )
+                    scoped = ScanService._apply_owasp_scope_to_normalized(
+                        owasp_category, normalized
+                    )
+                    if scoped is None:
+                        logger.debug(f"Finding filtered by OWASP scope: type={finding_data.get('type')}, location={loc}")
+                        continue
                     finding = Finding(
                         scan_id=scan_id,
                         tool_name=tool_name,
-                        type=ftype,
-                        severity=fsev,
-                        owasp_category=finding_data.get("owasp_category"),
+                        type=scoped["type"],
+                        severity=scoped["severity"],
+                        owasp_category=scoped["owasp_category"],
                         location=loc,
                         description=desc,
                         evidence=finding_data.get("evidence"),
                     )
                     db.add(finding)
-                    # Collect URLs from discovery tools for exploit phase
-                    if tool_name in settings.DISCOVERY_TOOLS:
-                        url = ScanService._extract_urls_from_finding(loc, target)
-                        if url and url not in discovered_urls:
-                            discovered_urls.append(url)
+                    findings_added += 1
+                    logger.info(f"Added finding: {finding.tool_name} - {finding.type} - {finding.severity} at {finding.location}")
+
+                return findings_added
+
+            if tool_result.success:
+                tool_run.status = ToolRunStatus.COMPLETED
+                
+                # Track if Nuclei had findings but also had issues (for better error reporting)
+                if tool_name == "Nuclei" and tool_result.findings:
+                    # Log finding count for diagnostics
+                    vuln_count = sum(1 for f in tool_result.findings if (f.get("type") or "").lower() == "vulnerability")
+                    info_count = len(tool_result.findings) - vuln_count
+                    logger.info(f"Nuclei findings: {vuln_count} vulnerabilities, {info_count} information")
+
+                findings_added = await persist_tool_findings(tool_result.findings)
             else:
                 if tool_result.error_message and "timeout" in (
                     tool_result.error_message or ""
@@ -733,8 +1217,11 @@ class ScanService:
                     tool_run.status = ToolRunStatus.FAILED
                 tool_run.error_message = tool_result.error_message
 
+                # Keep partial findings from timed-out tools (especially Nuclei) if available.
+                findings_added = await persist_tool_findings(tool_result.findings)
+
             await db.commit()
-            logger.info(f"Completed {tool_name}: {tool_run.status}")
+            logger.info(f"Completed {tool_name}: {tool_run.status}, added {findings_added} new findings to DB")
             
             # Generate per-tool report after completion
             try:
@@ -801,6 +1288,11 @@ class ScanService:
             for tr in tool_runs
         )
 
+        timeout_only = bool(tool_runs) and all(
+            tr.status in [ToolRunStatus.COMPLETED, ToolRunStatus.TIMEOUT]
+            for tr in tool_runs
+        ) and any(tr.status == ToolRunStatus.TIMEOUT for tr in tool_runs)
+
         # Update scan
         result = await db.execute(select(Scan).where(Scan.id == scan_id))
         scan = result.scalar_one()
@@ -841,7 +1333,17 @@ class ScanService:
                 exc_info=True,
             )
 
-        if has_errors:
+        if timeout_only:
+            scan.status = ScanStatus.COMPLETED
+            timeout_note = (
+                "Due to time limit, running phase completed with partial results."
+            )
+            if scan.error_summary:
+                if timeout_note not in scan.error_summary:
+                    scan.error_summary += f" {timeout_note}"
+            else:
+                scan.error_summary = timeout_note
+        elif has_errors:
             scan.status = ScanStatus.COMPLETED_WITH_ERRORS
         else:
             scan.status = ScanStatus.COMPLETED
@@ -868,6 +1370,8 @@ class ScanService:
             )
         except Exception as e:
             logger.warning("Could not schedule scan-finished email: %s", e)
+
+    AI_FALLBACK_MARKER = "AI_FALLBACK_MODE_ACTIVE"
 
     @staticmethod
     async def get_scan_status(
@@ -896,6 +1400,7 @@ class ScanService:
         )
         tool_runs = result.scalars().all()
 
+        fallback_active = bool(scan.error_summary and AI_FALLBACK_MARKER in scan.error_summary)
         return {
             "scan_id": scan.id,
             "status": scan.status.value,
@@ -914,6 +1419,8 @@ class ScanService:
                 }
                 for tr in tool_runs
             ],
+            "ai_fallback_active": fallback_active,
+            "ai_decision_error": scan.error_summary if fallback_active else None,
         }
 
     @staticmethod
@@ -1069,6 +1576,7 @@ class ScanService:
             else []
         )
 
+        fallback_active = bool(scan.error_summary and AI_FALLBACK_MARKER in scan.error_summary)
         return {
             "id": scan.id,
             "target": scan.target,
@@ -1083,6 +1591,8 @@ class ScanService:
                 "tools_to_run": tools_to_run,
                 "tools_skipped": tools_skipped,
                 "raw_response": scan.ai_raw_response,
+                "success": not fallback_active,
+                "error": scan.error_summary if fallback_active else None,
             },
             "tool_runs": [
                 {
@@ -1209,6 +1719,372 @@ class ScanService:
             "page": page,
             "page_size": page_size,
         }
+
+    @staticmethod
+    async def _run_intelligence_layer(
+        db: AsyncSession,
+        scan_id: int,
+        target: str,
+        owasp_category: str,
+        clues: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """PHASE 2: Intelligence Layer - Classify endpoints and tag risk.
+
+        Returns endpoint classification data for use in active testing.
+        """
+        from app.engines.endpoint_classifier import EndpointClassifier
+
+        # Get all discovered URLs from findings
+        result = await db.execute(
+            select(Finding.location)
+            .where(
+                Finding.scan_id == scan_id,
+                Finding.type.in_([FindingType.ENDPOINT, FindingType.PORT])
+            )
+            .distinct()
+        )
+        discovered_locations = [row[0] for row in result.all()]
+
+        # Add HTTP services from clues
+        http_services = clues.get("http_services", [])
+        all_urls = list(set(discovered_locations + http_services))
+
+        # Filter to HTTP URLs only
+        http_urls = [u for u in all_urls if str(u).startswith(("http://", "https://"))]
+
+        # Classify endpoints
+        classified_endpoints = EndpointClassifier.classify(http_urls)
+
+        # Store classification in scan metadata for later phases
+        result = await db.execute(select(Scan).where(Scan.id == scan_id))
+        scan = result.scalar_one()
+        scan.endpoint_classification = json.dumps({
+            "classified_endpoints": classified_endpoints,
+            "total_endpoints": len(classified_endpoints),
+            "auth_endpoints": len(EndpointClassifier.get_by_type(classified_endpoints, "auth")),
+            "admin_endpoints": len(EndpointClassifier.get_by_type(classified_endpoints, "admin")),
+            "api_endpoints": len(EndpointClassifier.get_by_type(classified_endpoints, "api")),
+        })
+        await db.commit()
+
+        logger.info(f"Intelligence Layer: classified {len(classified_endpoints)} endpoints for scan {scan_id}")
+
+        return {
+            "classified_endpoints": classified_endpoints,
+            "auth_endpoints": EndpointClassifier.get_by_type(classified_endpoints, "auth"),
+            "admin_endpoints": EndpointClassifier.get_by_type(classified_endpoints, "admin"),
+            "api_endpoints": EndpointClassifier.get_by_type(classified_endpoints, "api"),
+        }
+
+    @staticmethod
+    async def _run_active_testing(
+        db: AsyncSession,
+        scan_id: int,
+        target: str,
+        owasp_category: str,
+        endpoint_classification: Dict[str, Any],
+        clues: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """PHASE 4: Active Testing Engine - Run custom HTTP requests for OWASP category."""
+        from app.engines.active_tester import ActiveTester
+
+        clues = clues or {}
+        # URLs from DB (when recon findings were persisted) plus initial clues (always when Naabu/Httpx ran)
+        discovered_urls: List[str] = []
+        result = await db.execute(
+            select(Finding.location)
+            .where(
+                Finding.scan_id == scan_id,
+                Finding.type.in_([FindingType.ENDPOINT, FindingType.PORT])
+            )
+            .distinct()
+        )
+        discovered_urls = [row[0] for row in result.all()]
+
+        result = await db.execute(
+            select(Finding.location)
+            .where(
+                Finding.scan_id == scan_id,
+                Finding.tool_name == "Httpx"
+            )
+        )
+        discovered_urls.extend(row[0] for row in result.all())
+        for u in clues.get("http_services") or []:
+            if u:
+                discovered_urls.append(u)
+        discovered_urls = list(dict.fromkeys(discovered_urls))
+
+        # Filter to HTTP URLs only
+        http_urls = [u for u in discovered_urls if str(u).startswith(("http://", "https://"))]
+
+        # Run OWASP-specific active testing for ALL categories
+        active_test_results = await ActiveTester.run_owasp_tests(http_urls, owasp_category, target)
+
+        # Convert ActiveTestResult objects to dictionaries
+        results = []
+        for r in active_test_results:
+            results.append({
+                "url": r.url,
+                "payload": r.payload,
+                "status_code": r.status_code,
+                "success": r.success,
+                "confidence": r.confidence,
+                "evidence": r.evidence,
+                "owasp_category": r.owasp_category,
+                "severity": r.severity,
+                "indicators": r.indicators,
+                "test_type": owasp_category.split(":")[0].lower()  # e.g., "a01", "a07"
+            })
+
+        # Save active testing results to database as findings
+        for result_data in results:
+            if result_data.get("success") or result_data.get("confidence") in ["high", "medium"]:
+                normalized = ScanService._normalize_finding_classification(
+                    raw_type="vulnerability",
+                    raw_severity=result_data.get("severity", "medium"),
+                    raw_owasp_category=owasp_category,
+                )
+
+                finding = Finding(
+                    scan_id=scan_id,
+                    tool_name="ActiveTester",
+                    type=normalized["type"],
+                    severity=normalized["severity"],
+                    owasp_category=normalized["owasp_category"],
+                    location=result_data["url"],
+                    description=f"Active Testing: {result_data.get('evidence', 'Potential vulnerability detected')}",
+                    evidence=json.dumps({
+                        "payload": result_data.get("payload"),
+                        "status_code": result_data["status_code"],
+                        "indicators": result_data.get("indicators", []),
+                        "test_type": result_data.get("test_type"),
+                        "confidence": result_data.get("confidence")
+                    }),
+                )
+                db.add(finding)
+
+        await db.commit()
+
+        logger.info(f"Active Testing: completed {len(results)} tests for scan {scan_id}")
+        return results
+
+    @staticmethod
+    async def _run_response_analysis(
+        db: AsyncSession,
+        scan_id: int,
+        target: str,
+        owasp_category: str,
+        active_test_results: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """PHASE 5: Response Analysis - Analyze responses for vulnerability indicators."""
+        from app.engines.response_analyzer import analyze_login_response
+
+        vulnerability_findings = []
+
+        for result in active_test_results:
+            test_type = result.get("test_type", "")
+
+            if test_type == "a07":  # Authentication bypass
+                # Analyze login responses
+                analysis = analyze_login_response(
+                    status_code=result["status_code"],
+                    body="",  # We don't have the full body, just status
+                    headers={}
+                )
+
+                if analysis["success"] and analysis["confidence"] in ["high", "medium"]:
+                    vulnerability_findings.append({
+                        "type": "vulnerability",
+                        "severity": "high",
+                        "location": result["url"],
+                        "description": f"Authentication Bypass: {analysis['evidence']}",
+                        "evidence": json.dumps({
+                            "analysis": analysis,
+                            "payload": result.get("payload"),
+                            "test_type": test_type
+                        }),
+                        "owasp_category": owasp_category
+                    })
+
+            elif test_type == "a01":  # IDOR
+                # For IDOR, successful access to other user's data is a vulnerability
+                if result.get("success") and result["status_code"] == 200:
+                    vulnerability_findings.append({
+                        "type": "vulnerability",
+                        "severity": "high",
+                        "location": result["url"],
+                        "description": f"IDOR Vulnerability: {result.get('evidence', 'Access to unauthorized resource')}",
+                        "evidence": json.dumps({
+                            "status_code": result["status_code"],
+                            "payload": result.get("payload"),
+                            "test_type": test_type
+                        }),
+                        "owasp_category": owasp_category
+                    })
+
+            elif test_type in ["a03", "a04", "a05", "a06", "a08", "a09", "a10"]:
+                # For other categories, any successful test indicates a potential vulnerability
+                if result.get("success") or result.get("confidence") in ["high", "medium"]:
+                    vulnerability_findings.append({
+                        "type": "vulnerability",
+                        "severity": result.get("severity", "medium"),
+                        "location": result["url"],
+                        "description": f"OWASP {test_type.upper()} Vulnerability: {result.get('evidence', 'Potential security issue detected')}",
+                        "evidence": json.dumps({
+                            "status_code": result["status_code"],
+                            "payload": result.get("payload"),
+                            "test_type": test_type,
+                            "confidence": result.get("confidence")
+                        }),
+                        "owasp_category": owasp_category
+                    })
+
+        # Save response analysis findings
+        for finding_data in vulnerability_findings:
+            normalized = ScanService._normalize_finding_classification(
+                raw_type=finding_data["type"],
+                raw_severity=finding_data["severity"],
+                raw_owasp_category=owasp_category,
+            )
+
+            finding = Finding(
+                scan_id=scan_id,
+                tool_name="ResponseAnalyzer",
+                type=normalized["type"],
+                severity=normalized["severity"],
+                owasp_category=normalized["owasp_category"],
+                location=finding_data["location"],
+                description=finding_data["description"],
+                evidence=finding_data["evidence"],
+            )
+            db.add(finding)
+
+        await db.commit()
+
+        logger.info(f"Response Analysis: found {len(vulnerability_findings)} vulnerabilities for scan {scan_id}")
+        return vulnerability_findings
+
+    @staticmethod
+    async def _run_correlation(
+        db: AsyncSession,
+        scan_id: int,
+        target: str,
+        owasp_category: str,
+        endpoint_classification: Dict[str, Any]
+    ) -> None:
+        """PHASE 6: Correlation - Combine results from all tools and active testing."""
+        # Get all findings for this scan
+        result = await db.execute(
+            select(Finding)
+            .where(Finding.scan_id == scan_id)
+            .order_by(Finding.created_at)
+        )
+        all_findings = result.scalars().all()
+
+        # Group findings by location/endpoint
+        findings_by_location = {}
+        for finding in all_findings:
+            loc = finding.location
+            if loc not in findings_by_location:
+                findings_by_location[loc] = []
+            findings_by_location[loc].append(finding)
+
+        # Look for correlated vulnerabilities
+        correlation_findings = []
+
+        # Example: If Nuclei finds SQL injection and active testing confirms it
+        for location, findings in findings_by_location.items():
+            nuclei_sqli = any(
+                f.tool_name == "Nuclei" and "sql" in f.description.lower()
+                for f in findings
+            )
+            active_sqli_confirm = any(
+                f.tool_name == "ActiveTester" and "sqli" in f.evidence.lower()
+                for f in findings
+            )
+
+            if nuclei_sqli and active_sqli_confirm:
+                correlation_findings.append({
+                    "type": "vulnerability",
+                    "severity": "high",
+                    "location": location,
+                    "description": "Correlated SQL Injection: Detected by Nuclei and confirmed by active testing",
+                    "evidence": json.dumps({
+                        "correlation_type": "sqli_confirmation",
+                        "tools": ["Nuclei", "ActiveTester"],
+                        "findings_count": len(findings)
+                    }),
+                    "owasp_category": owasp_category
+                })
+
+        # Save correlation findings
+        for finding_data in correlation_findings:
+            normalized = ScanService._normalize_finding_classification(
+                raw_type=finding_data["type"],
+                raw_severity=finding_data["severity"],
+                raw_owasp_category=owasp_category,
+            )
+
+            finding = Finding(
+                scan_id=scan_id,
+                tool_name="CorrelationEngine",
+                type=normalized["type"],
+                severity=normalized["severity"],
+                owasp_category=normalized["owasp_category"],
+                location=finding_data["location"],
+                description=finding_data["description"],
+                evidence=finding_data["evidence"],
+            )
+            db.add(finding)
+
+        await db.commit()
+
+        logger.info(f"Correlation: created {len(correlation_findings)} correlated findings for scan {scan_id}")
+
+    @staticmethod
+    async def _run_smart_risk_scoring(
+        db: AsyncSession,
+        scan_id: int,
+        owasp_category: str
+    ) -> None:
+        """PHASE 7: Smart Risk Scoring - Adjust severity based on verified exploits."""
+        # Get all findings
+        result = await db.execute(
+            select(Finding)
+            .where(Finding.scan_id == scan_id)
+        )
+        findings = result.scalars().all()
+
+        for finding in findings:
+            original_severity = finding.severity
+
+            # Boost severity for verified exploits
+            if finding.tool_name == "ActiveTester":
+                # Active testing results are verified exploits
+                if finding.severity == FindingSeverity.MEDIUM:
+                    finding.severity = FindingSeverity.HIGH
+                elif finding.severity == FindingSeverity.LOW:
+                    finding.severity = FindingSeverity.MEDIUM
+
+            elif finding.tool_name == "CorrelationEngine":
+                # Correlated findings are high confidence
+                finding.severity = FindingSeverity.HIGH
+
+            elif finding.tool_name == "ResponseAnalyzer":
+                # Response analysis indicates real vulnerabilities
+                if "bypass" in finding.description.lower():
+                    finding.severity = FindingSeverity.CRITICAL
+
+            # Log severity changes
+            if finding.severity != original_severity:
+                logger.info(
+                    f"Risk Scoring: {finding.location} severity {original_severity.value} -> {finding.severity.value} "
+                    f"(tool: {finding.tool_name})"
+                )
+
+        await db.commit()
+
+        logger.info(f"Smart Risk Scoring: completed severity adjustments for scan {scan_id}")
 
     @staticmethod
     async def delete_scan(db: AsyncSession, scan_id: int) -> bool:

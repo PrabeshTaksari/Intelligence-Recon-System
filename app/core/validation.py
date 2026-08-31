@@ -60,25 +60,45 @@ def validate_domain(target: str) -> Tuple[bool, str]:
     Returns:
         Tuple of (is_valid, message)
     """
-    # Remove protocol if present
-    if target.startswith(('http://', 'https://')):
+    # Remove protocol if present, then normalize to host (strip :port for validation).
+    # This allows targets like `localhost:3000` or `127.0.0.1:8080`.
+    original = target
+    if target.startswith(("http://", "https://")):
         parsed = urlparse(target)
-        target = parsed.netloc
+        target = parsed.netloc or parsed.path
+
+    # Strip port from host:port
+    host = (target or "").strip()
+    # IPv6 in brackets: [::1]:3000
+    if host.startswith("["):
+        # Try bracketed host:port first
+        m = re.match(r"^\[([^\]]+)\]:(\d+)$", host)
+        if m:
+            host = m.group(1)
+        else:
+            # No port, just strip brackets
+            host = host.strip("[]")
+    else:
+        # IPv4/hostname:port
+        if ":" in host:
+            h, p = host.rsplit(":", 1)
+            if p.isdigit():
+                host = h
     
     # Check if it's an IP address
-    if is_valid_ip_format(target):
-        return True, f"Valid IP address: {target}"
+    if is_valid_ip_format(host):
+        return True, f"Valid IP address: {host}"
     
     # Check if it's a domain
-    if not is_valid_domain_format(target):
-        return False, f"Invalid domain format: {target}"
+    if not is_valid_domain_format(host):
+        return False, f"Invalid domain format: {original}"
     
     # Check if domain is resolvable
-    if not is_resolvable_domain(target):
-        return False, f"Domain is not resolvable via DNS: {target}"
+    if not is_resolvable_domain(host):
+        return False, f"Domain is not resolvable via DNS: {host}"
     
     # Optionally, check if domain is reachable (can be skipped for privacy reasons)
     # if not is_reachable_domain(target):
     #     return False, f"Domain is not reachable via HTTP/HTTPS: {target}"
     
-    return True, f"Valid hosted domain: {target}"
+    return True, f"Valid hosted domain: {host}"

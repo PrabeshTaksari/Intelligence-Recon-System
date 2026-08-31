@@ -1,5 +1,6 @@
 """AI-powered report content generation using Gemini. Reports are strictly AI-only; no fallbacks."""
 import asyncio
+import html
 import json
 import httpx
 from typing import Dict, Any, List, Optional
@@ -11,6 +12,20 @@ logger = get_logger(__name__)
 
 GEMINI_MAX_RETRIES = 3
 
+def deduplicate_findings(findings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Deduplicate findings across tools to avoid over-counting the same issue.
+    Keyed on vulnerability/template + location.
+    """
+    unique = {}
+    for f in findings:
+        key = (
+            f.get("description") or f.get("template_id") or "",
+            f.get("location") or ""
+        )
+        if key not in unique:
+            unique[key] = f
+    return list(unique.values())
 
 def _429_backoff_seconds(attempt: int) -> int:
     """Seconds to wait before retry on 429. Uses GEMINI_429_BACKOFF_BASE (default 3 → 3, 6, 12)."""
@@ -212,6 +227,73 @@ Output ONLY the conclusion paragraph(s), no headings."""
         raise
 
 
+async def generate_remediation_playbook_table_html(
+    findings_payload: List[Dict[str, Any]],
+    target: str,
+    owasp_label: str,
+) -> str:
+    """Build an HTML table of per-finding remediation and verification steps for PDF reports.
+
+    Returns a complete <table> element or empty string on failure / no API key / no rows.
+    """
+    if not findings_payload:
+        return ""
+    if not settings.get_gemini_backends():
+        return ""
+
+    rows_in = findings_payload[:18]
+    prompt = f"""You are a senior application security engineer. Produce remediation guidance for a formal PDF report.
+
+Target: {target}
+Assessment focus: {owasp_label}
+
+Findings (JSON array, each item has ref, severity, tool, location, description):
+{json.dumps(rows_in, ensure_ascii=False, indent=2)}
+
+Output VALID JSON ONLY (no markdown fences):
+{{
+  "rows": [
+    {{
+      "ref": <same ref as input>,
+      "severity": "<string>",
+      "summary": "<=100 chars, what is wrong>",
+      "remediation": "<2-4 sentences: concrete technical fixes: config, code patterns, patches, disable default creds, etc.>",
+      "verification": "<1-2 sentences: how to retest or confirm fix>"
+    }}
+  ]
+}}
+
+Include one object per input finding, same order, same ref. Use clear professional language. Do not use em dashes."""
+
+    try:
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.25, "maxOutputTokens": 4096},
+        }
+        resp = await _gemini_post_with_retry(payload, timeout=45.0)
+        text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        data = _parse_ai_json(text)
+        out_rows = data.get("rows")
+        if not isinstance(out_rows, list) or not out_rows:
+            return ""
+        parts = [
+            '<table class="irs-remediation-table"><thead><tr>',
+            "<th>#</th><th>Severity</th><th>Summary</th><th>Remediation</th><th>Verification</th>",
+            "</tr></thead><tbody>",
+        ]
+        for r in out_rows:
+            parts.append("<tr>")
+            for key in ("ref", "severity", "summary", "remediation", "verification"):
+                cell = r.get(key, "")
+                parts.append(f"<td>{html.escape(str(cell))}</td>")
+            parts.append("</tr>")
+        parts.append("</tbody></table>")
+        return "".join(parts)
+    except Exception as e:
+        logger.warning("Remediation playbook AI generation failed: %s", e)
+        raise
+
+
 def _fallback_executive_summary(
     target: str,
     owasp_category: str,
@@ -237,7 +319,7 @@ def _fallback_executive_summary(
     return (
         f"The target {target} was analyzed for {owasp_category}. "
         f"No critical or high severity vulnerabilities were detected. "
-        f"{total} informational or low-severity items were documented. "
+        f"{total} informational reconnaissance items were documented. "
         "Target appears secure for the scope tested."
     )
 
@@ -338,12 +420,12 @@ def _fallback_attack_relevance(
     else:
         relevance_summary = (
             f"The scan targeted {target} for attack type {owasp_name} ({owasp_category}). "
-            f"Findings are reconnaissance or low severity: open ports, URLs, or subdomains. "
+            "Findings are reconnaissance and informational in nature: open ports, URLs, or subdomains. "
             "No critical, high, or medium vulnerabilities were found that would directly enable this attack type."
         )
         detail_bullets = [
             f"Tools that produced findings: {tools_list}.",
-            f"{info_low} discovery or low-severity {'item' if info_low == 1 else 'items'} help map the target but are not direct attack vectors.",
+            f"{info_low} discovery {'item' if info_low == 1 else 'items'} help map the target but are not direct attack vectors.",
             f"To assess vulnerability to {owasp_name.lower()}, run vulnerability scanners and review results.",
         ]
         can_support_attack = False
@@ -680,3 +762,4 @@ def _fallback_conclusion(
     if recommendations:
         parts.append(" " + recommendations[0] if recommendations else "")
     return "".join(parts)
+

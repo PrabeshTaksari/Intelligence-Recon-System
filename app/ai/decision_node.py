@@ -9,6 +9,9 @@ from app.core.logging import get_logger
 from app.ai.prompts import build_decision_prompt
 from app.ai.report_generator import _gemini_post_with_retry
 
+# Fixed safe fallback tools used when AI decision is unavailable or invalid.
+SAFE_FALLBACK_TOOLS = ["Naabu", "Httpx", "Nuclei", "Subfinder", "DNSx"]
+
 logger = get_logger(__name__)
 
 
@@ -110,6 +113,16 @@ async def decide_tools(
             skip for skip in skipped_tools
             if skip.get("tool") in selected_tools  # Only if user selected this tool
         ]
+
+        # Guardrail: avoid contradictory AI output (same tool in both run + skipped).
+        # If it happens, prefer the "skip" instruction for execution consistency.
+        skipped_tool_names = {
+            str(skip.get("tool")).strip()
+            for skip in filtered_skipped
+            if isinstance(skip, dict) and skip.get("tool")
+        }
+        if skipped_tool_names:
+            valid_tools = [t for t in valid_tools if str(t).strip() not in skipped_tool_names]
         
         # Log tools that AI wanted to skip but user didn't select (these are ignored)
         all_skipped_from_ai = [skip.get("tool") for skip in skipped_tools]

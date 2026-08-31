@@ -56,7 +56,10 @@ async def list_scheduled_scan_results(db: AsyncSession = Depends(get_db)):
         )
         top = r2.scalar_one_or_none()
         highest_severity = top.value if top else None
-        is_saved = bool(scan.error_summary and "SAVED_SCAN" in scan.error_summary)
+        is_saved = bool(
+            getattr(scan, "is_saved", False)
+            or (scan.error_summary and "SAVED_SCAN" in scan.error_summary)
+        )
         out.append({
             "id": scan.id,
             "target": scan.target,

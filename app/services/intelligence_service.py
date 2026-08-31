@@ -1,8 +1,11 @@
 """Intelligence service for generating real-time reconnaissance narratives."""
 import asyncio
 import json
+import re
+import pytz
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, Any, List, Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,6 +20,8 @@ logger = get_logger(__name__)
 
 # In-memory cache so repeated views of the same scan's intelligence summary
 # reuse the existing result instead of calling Gemini again.
+_INTELLIGENCE_SUMMARY_CACHE_VERSION = 5
+# scan_id -> {"version": int, "summary": dict}
 _INTELLIGENCE_SUMMARY_CACHE: Dict[int, Dict[str, Any]] = {}
 
 
@@ -24,14 +29,195 @@ class IntelligenceService:
     """Service for generating intelligence-driven reconnaissance summaries."""
 
     @staticmethod
-    def _get_real_command(tool_name: str, target: str) -> str:
+    def _read_raw_output(raw_output_path: Optional[str], max_bytes: int = 512 * 1024) -> Optional[str]:
+        """Read raw tool output for frontend display (bounded to avoid huge payloads)."""
+        if not raw_output_path:
+            return None
+        try:
+            p = Path(str(raw_output_path))
+            if not p.exists() or not p.is_file():
+                return None
+            content = p.read_text(encoding="utf-8", errors="replace")
+            if len(content) > max_bytes:
+                content = content[:max_bytes] + "\n\n... (output truncated)"
+            content = content.strip("\n")
+            return content or None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _extract_clues_from_findings(findings: List[Finding]) -> Dict[str, Any]:
+        """Reconstruct initial clue data from persisted Naabu/Httpx findings."""
+        clues: Dict[str, Any] = {
+            "open_ports": [],
+            "ip_addresses": [],
+            "http_services": [],
+            "server_headers": [],
+            "page_titles": [],
+            "status_codes": [],
+            "technologies": [],
+        }
+
+        def _add_unique(key: str, value: str):
+            v = (value or "").strip()
+            if not v:
+                return
+            if v not in clues[key]:
+                clues[key].append(v)
+
+        for f in findings:
+            tool = (f.tool_name or "").lower()
+            if tool == "naabu":
+                # location usually like "host:port" or just "port"
+                loc = (f.location or "").strip()
+                if loc:
+                    port = loc.split(":")[-1] if ":" in loc else loc
+                    if port.isdigit():
+                        _add_unique("open_ports", port)
+                # description often contains "IP: x.x.x.x"
+                desc = (f.description or "")
+                m = re.search(r"IP:\s*([0-9a-fA-F.:]+)", desc, flags=re.I)
+                if m:
+                    _add_unique("ip_addresses", m.group(1))
+            elif tool == "httpx":
+                # url is stored in location; evidence includes title/status/tech/webserver
+                _add_unique("http_services", (f.location or "").strip())
+                try:
+                    evidence = json.loads(f.evidence) if getattr(f, "evidence", None) else {}
+                except Exception:
+                    evidence = {}
+                title = evidence.get("title")
+                if title:
+                    _add_unique("page_titles", str(title))
+                sc = evidence.get("status_code")
+                if sc is not None:
+                    _add_unique("status_codes", str(sc))
+                ws = evidence.get("webserver") or evidence.get("server")
+                if ws:
+                    _add_unique("server_headers", str(ws))
+                techs = evidence.get("technologies") or evidence.get("tech") or []
+                if isinstance(techs, list):
+                    for t in techs:
+                        _add_unique("technologies", str(t))
+
+        # Stable ordering for nicer UI
+        try:
+            clues["open_ports"] = sorted(clues["open_ports"], key=lambda x: int(x) if str(x).isdigit() else 999999)
+        except Exception:
+            pass
+        return clues
+
+    @staticmethod
+    def _extract_clues_from_error_summary(error_summary: Optional[str]) -> Dict[str, Any]:
+        """Extract initial clue values from scan.error_summary text."""
+        clues: Dict[str, Any] = {
+            "open_ports": [],
+            "ip_addresses": [],
+            "http_services": [],
+            "server_headers": [],
+            "page_titles": [],
+            "status_codes": [],
+            "technologies": [],
+        }
+        if not error_summary:
+            return clues
+        try:
+            m = re.search(
+                r"Initial Reconnaissance Clues:(.*?)(?:\n\nAI selected|\n\n$|$)",
+                error_summary,
+                re.DOTALL,
+            )
+            if not m:
+                return clues
+            clues_text = m.group(1) or ""
+            label_map = {
+                "open ports": "open_ports",
+                "http services": "http_services",
+                "server headers": "server_headers",
+                "page titles": "page_titles",
+                "status codes": "status_codes",
+                "technologies detected": "technologies",
+            }
+            for line in clues_text.split("\n"):
+                line = (line or "").strip()
+                if not line.startswith("- ") or ":" not in line:
+                    continue
+                left, right = line[2:].split(":", 1)
+                key = label_map.get(left.strip().lower())
+                if not key:
+                    continue
+                val = right.strip()
+                if val.lower() in {"none", "none detected", "null", "[]"}:
+                    continue
+                if val.startswith("[") and val.endswith("]"):
+                    inner = val[1:-1].strip()
+                    if not inner:
+                        continue
+                    items = [x.strip().strip("'").strip('"') for x in inner.split(",")]
+                    for item in items:
+                        if item and item not in clues[key]:
+                            clues[key].append(item)
+                else:
+                    if val not in clues[key]:
+                        clues[key].append(val)
+            try:
+                clues["open_ports"] = sorted(clues["open_ports"], key=lambda x: int(x) if str(x).isdigit() else 999999)
+            except Exception:
+                pass
+        except Exception:
+            return clues
+        return clues
+
+    @staticmethod
+    def _safe_json_loads(text: Optional[str]) -> Dict[str, Any]:
+        if not text:
+            return {}
+        try:
+            val = json.loads(text)
+            return val if isinstance(val, dict) else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _estimate_observed_items_from_tool_runs(tool_runs: List[ToolRun]) -> int:
+        """Best-effort observed item count from completed tool summaries (for live UI while findings persist later)."""
+        total = 0
+        for tr in tool_runs:
+            if tr.status != ToolRunStatus.COMPLETED:
+                continue
+            s = (getattr(tr, "summary", None) or "").strip()
+            if not s:
+                continue
+            m = re.search(r"\bfound\s+(\d+)\b", s, flags=re.I)
+            if m:
+                try:
+                    total += int(m.group(1))
+                except Exception:
+                    pass
+        return max(total, 0)
+
+    @staticmethod
+    def _get_real_command(
+        tool_name: str,
+        target: str,
+        owasp_category: Optional[str] = None,
+    ) -> str:
         """Return the actual CLI command that would be run for this tool (for display)."""
         try:
             from app.tools.tools_impl import TOOL_REGISTRY
             klass = TOOL_REGISTRY.get(tool_name)
             if klass:
                 out = Path(settings.SCANS_DIR) / "0" / f"{tool_name.lower()}.out"
-                return " ".join(str(x) for x in klass().build_command(target, out))
+                # Some tools (Nuclei) need OWASP category to build the correct command.
+                # This is display-only; actual execution is handled by executor/scan_service.
+                return " ".join(
+                    str(x)
+                    for x in klass().build_command(
+                        target,
+                        out,
+                        owasp_category=owasp_category,
+                    )
+                )
         except Exception:
             pass
         return f"{tool_name.lower()} -target {target}"
@@ -61,7 +247,9 @@ class IntelligenceService:
             scan.status in [ScanStatus.COMPLETED, ScanStatus.COMPLETED_WITH_ERRORS]
             and scan_id in _INTELLIGENCE_SUMMARY_CACHE
         ):
-            return _INTELLIGENCE_SUMMARY_CACHE[scan_id]
+            cached = _INTELLIGENCE_SUMMARY_CACHE.get(scan_id) or {}
+            if cached.get("version") == _INTELLIGENCE_SUMMARY_CACHE_VERSION:
+                return cached.get("summary") or cached
         # Get findings
         result = await db.execute(
             select(Finding)
@@ -132,7 +320,12 @@ class IntelligenceService:
                     tool_run, tool_findings, scan
                 )
             )
-        
+
+        # Pipeline phases (Active Testing, Response Analysis) do not create ToolRun rows; still emit execution-style sections when findings exist
+        IntelligenceService._append_synthetic_pipeline_tool_sections(
+            scan, tool_runs, findings, sections
+        )
+
         # Phase 5: After scan complete — Relevance first, then Full Scan Summary
         if scan.status in [ScanStatus.COMPLETED, ScanStatus.COMPLETED_WITH_ERRORS]:
             # 1) Relevance to Chosen Attack Type (always, using fallback-only logic)
@@ -155,12 +348,50 @@ class IntelligenceService:
             "status": scan.status.value,
             "sections": sections,
             "created_at": scan.created_at.isoformat() if scan.created_at else None,
-            "updated_at": datetime.utcnow().isoformat(),
+            "updated_at": scan.created_at.isoformat() if scan.created_at else None,
         }
         # Cache summaries for completed scans so subsequent views don't call Gemini again.
         if scan.status in [ScanStatus.COMPLETED, ScanStatus.COMPLETED_WITH_ERRORS]:
-            _INTELLIGENCE_SUMMARY_CACHE[scan_id] = summary
+            _INTELLIGENCE_SUMMARY_CACHE[scan_id] = {
+                "version": _INTELLIGENCE_SUMMARY_CACHE_VERSION,
+                "summary": summary,
+            }
         return summary
+
+    @staticmethod
+    def _append_synthetic_pipeline_tool_sections(
+        scan: Scan,
+        tool_runs: List[ToolRun],
+        findings: List[Finding],
+        sections: List[Dict[str, Any]],
+    ) -> None:
+        """Add execution-detail sections for tools that persist findings but have no ToolRun (pipeline-only)."""
+        covered = {
+            (tr.tool_name or "").lower()
+            for tr in tool_runs
+            if tr.status
+            in (ToolRunStatus.COMPLETED, ToolRunStatus.FAILED, ToolRunStatus.TIMEOUT)
+        }
+        for synth_name in ("ActiveTester", "ResponseAnalyzer"):
+            key = synth_name.lower()
+            if key in covered:
+                continue
+            synth_findings = [f for f in findings if (f.tool_name or "").lower() == key]
+            if not synth_findings:
+                continue
+            synthetic_tr = SimpleNamespace(
+                tool_name=synth_name,
+                status=ToolRunStatus.COMPLETED,
+                finished_at=scan.completed_at or scan.created_at,
+                started_at=scan.created_at,
+                error_message=None,
+                raw_output_path=None,
+            )
+            sections.append(
+                IntelligenceService._generate_tool_result_section(
+                    synthetic_tr, synth_findings, scan
+                )
+            )
     
     @staticmethod
     def _generate_executive_summary(
@@ -177,7 +408,9 @@ class IntelligenceService:
         failed_tools = [tr for tr in tool_runs if tr.status in (ToolRunStatus.FAILED, ToolRunStatus.TIMEOUT)]
         failed_tool_names = [tr.tool_name for tr in failed_tools]
         
+        # User-facing totals should stay consistent with the saved findings table.
         total = len(findings)
+        display_total = total
         critical = severity_counts["critical"]
         high = severity_counts["high"]
         medium = severity_counts["medium"]
@@ -206,28 +439,260 @@ class IntelligenceService:
         if total == 0 and risk_score == 0:
             risk_level = "N/A"
 
-        # Key Findings: one row per finding (port, endpoint, information, asset, vulnerability); dedupe by (tool, location)
+        # Key Findings (Executive Summary):
+        # Keep this professional and scannable: prioritize actionable items and cap noisy recon tools.
+        # Full tool outputs remain available in per-tool sections.
         active_types = ("port", "endpoint", "information", "asset", "vulnerability")
-        top_findings = []
         seen_key = set()
-        for f in findings:
-            ftype = f.type.value if hasattr(f.type, "value") else str(f.type)
+
+        def _tool_lower(x: str | None) -> str:
+            return (x or "").strip().lower()
+
+        def _type_str(x) -> str:
+            return x.value if hasattr(x, "value") else str(x)
+
+        def _sev_str(x) -> str:
+            return x.value if hasattr(x, "value") else str(x)
+
+        # Priority: vulnerabilities first, then exposed ports, then live services, then assets, then endpoints.
+        type_priority = {"vulnerability": 0, "port": 1, "information": 2, "asset": 3, "endpoint": 4}
+        severity_priority = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+
+        def _is_noisy_endpoint(tool_l: str) -> bool:
+            # Tools that can produce huge URL lists; keep a small sample in Key Findings.
+            return tool_l in {"gau", "katana", "gospider", "ffuf", "wfuzz"}
+
+        # Sort findings by priority (still deduped by (tool, location))
+        sorted_findings = sorted(
+            findings,
+            key=lambda f: (
+                type_priority.get(_type_str(getattr(f, "type", "")).lower(), 9),
+                severity_priority.get(_sev_str(getattr(f, "severity", "")).lower(), 9),
+            ),
+        )
+
+        top_findings: List[Dict[str, Any]] = []
+        key_findings_v2_rows: List[Dict[str, Any]] = []
+        key_to_row_index: Dict[tuple[str, str], int] = {}
+        # Key Findings should not arbitrarily cap noisy recon tools.
+        # We still deduplicate by (tool_name, location) and keep ordering by priority.
+        per_tool_limits = {}
+        per_tool_counts: Dict[str, int] = {}
+        per_tool_total: Dict[str, int] = {}
+
+        for f in sorted_findings:
+            ftype = _type_str(getattr(f, "type", "")).lower()
             if ftype not in active_types:
                 continue
-            key = (f.tool_name or "", f.location or "")
+            tool_l = _tool_lower(getattr(f, "tool_name", None))
+            per_tool_total[tool_l] = per_tool_total.get(tool_l, 0) + 1
+
+            key = (getattr(f, "tool_name", "") or "", getattr(f, "location", "") or "")
+            # For Key Findings we deduplicate by (tool_name, location),
+            # but we may still upgrade missing fields if later duplicates
+            # contain better evidence (e.g., status codes).
             if key in seen_key:
+                idx = key_to_row_index.get(key)
+                if idx is None:
+                    continue
+                row = key_findings_v2_rows[idx]
+                desc = IntelligenceService._dedupe_description(getattr(f, "description", "") or "")
+                # Build tool/type evidence helpers
+                raw_evidence = getattr(f, "evidence", None)
+                raw_evidence_text = str(raw_evidence) if raw_evidence is not None else ""
+                evidence = IntelligenceService._safe_json_loads(raw_evidence)
+                # Upgrade Status Code if present in evidence text (GoSpider/Katana/FFuf)
+                if row.get("Status Code", "—") == "—":
+                    m = re.search(r"\[?code[-\s]?(\d{3})\]?", raw_evidence_text, flags=re.I)
+                    if m:
+                        row["Status Code"] = m.group(1)
+                    elif tool_l == "ffuf":
+                        sc = evidence.get("status")
+                        if sc is not None:
+                            row["Status Code"] = str(sc)
+
+                # Upgrade URL if we can (CeWL and Naabu)
+                if tool_l == "cewl" and row.get("URL", "—") == "—" and location:
+                    row["URL"] = location
+                if tool_l == "naabu" and row.get("URL", "—") == "—":
+                    ip = evidence.get("ip") or ""
+                    port = row.get("Port")
+                    tls = evidence.get("tls", None)
+                    if port and ip:
+                        proto = "https" if tls is True or str(tls).lower() == "true" else "http"
+                        row["URL"] = f"{proto}://{ip}:{port}"
+                        if row.get("Service", "—") == "—":
+                            row["Service"] = proto
+                        if row.get("Technology", "—") == "—":
+                            row["Technology"] = "TLS" if proto == "https" else "TCP"
+
+                # Upgrade IP Address for Httpx
+                if tool_l == "httpx" and row.get("IP Address", "—") == "—":
+                    ip = evidence.get("ip") or evidence.get("address") or ""
+                    if ip:
+                        row["IP Address"] = str(ip)
+
                 continue
+
             seen_key.add(key)
-            desc = IntelligenceService._dedupe_description(f.description)
-            sev = f.severity.value if hasattr(f.severity, "value") else str(f.severity)
-            top_findings.append({
-                "tool": f.tool_name,
-                "type": ftype,
-                "severity": sev,
-                # Keep location/description readable but allow wrapping across multiple lines (no ellipsis truncation)
-                "location": (f.location or "")[:200],
-                "description": desc if len(desc) <= 300 else desc[:300],
-            })
+
+            # No arbitrary cap on Key Findings table rows.
+
+            per_tool_counts[tool_l] = per_tool_counts.get(tool_l, 0) + 1
+
+            desc = IntelligenceService._dedupe_description(getattr(f, "description", "") or "")
+            sev = _sev_str(getattr(f, "severity", "")).lower()
+
+            # Key Findings should focus on high-impact issues: do not include INFO-only rows.
+            if sev == "info":
+                continue
+
+            tool_name = getattr(f, "tool_name", None) or ""
+            location = (getattr(f, "location", "") or "")[:200]
+            evidence = IntelligenceService._safe_json_loads(getattr(f, "evidence", None))
+            raw_evidence = getattr(f, "evidence", None)
+            raw_evidence_text = str(raw_evidence) if raw_evidence is not None else ""
+            # Build structured row for professional Key Findings table
+            row = {
+                "Tool (Severity)": f"{sev} {tool_name}".strip(),
+                "Target": scan.target or "—",
+                "IP Address": "—",
+                "Port": "—",
+                "Service": "—",
+                "URL": "—",
+                "Status Code": "—",
+                "Technology": "—",
+                "Vulnerability": "—",
+                "Type / Template": "—",
+            }
+
+            # Common URL/location
+            if location.startswith("http://") or location.startswith("https://"):
+                row["URL"] = location
+
+            # Tool/type specific extraction
+            if tool_l == "naabu":
+                # location: host:port
+                if ":" in location:
+                    port = location.split(":")[-1]
+                    row["Port"] = port if port else "—"
+                ip = evidence.get("ip") or ""
+                if not ip:
+                    m = re.search(r"IP:\s*([0-9a-fA-F.:]+)", getattr(f, "description", "") or "", flags=re.I)
+                    ip = m.group(1) if m else ""
+                if ip:
+                    row["IP Address"] = ip
+                row["Type / Template"] = "Open port"
+                # Build a best-effort HTTP URL + protocol-based service/technology for UI completeness.
+                # Naabu evidence includes tls/protocol in its JSON.
+                tls = evidence.get("tls", None)
+                proto = evidence.get("protocol", None)
+                if proto:
+                    proto = str(proto).lower()
+                if proto not in {"tcp"}:
+                    # If protocol isn't provided, decide from tls flag
+                    proto = "https" if tls is True or str(tls).lower() == "true" else "http"
+                # Only fill URL/service/technology if we have ip+port
+                if row.get("IP Address", "—") != "—" and row.get("Port", "—") != "—":
+                    row["URL"] = f"{proto}://{row['IP Address']}:{row['Port']}"
+                    row["Service"] = proto
+                    row["Technology"] = "TLS" if proto == "https" else "TCP"
+            elif tool_l == "httpx":
+                url = evidence.get("url") or evidence.get("input") or location
+                if url and (str(url).startswith("http://") or str(url).startswith("https://")):
+                    row["URL"] = str(url)
+                    # Extract port from URL if present (e.g., :80, :443)
+                    if row["Port"] == "—":
+                        m_port = re.match(r"^https?://[^/]+:(\d+)(?:/|$)", str(url).strip(), flags=re.I)
+                        if m_port:
+                            row["Port"] = m_port.group(1)
+                sc = evidence.get("status_code")
+                if sc is not None and str(sc).strip() != "":
+                    row["Status Code"] = str(sc)
+                ws = evidence.get("webserver") or evidence.get("server")
+                if ws:
+                    row["Service"] = str(ws)
+                # IP for UI completeness
+                ip = evidence.get("ip") or evidence.get("address") or ""
+                if ip and row.get("IP Address", "—") == "—":
+                    row["IP Address"] = str(ip)
+                techs = evidence.get("technologies") or evidence.get("tech") or []
+                if isinstance(techs, list) and techs:
+                    row["Technology"] = ", ".join(str(t) for t in techs[:6] if str(t).strip()) or "—"
+                title = evidence.get("title")
+                if title:
+                    row["Type / Template"] = f"HTTP service: {sc if sc is not None else '—'} - {title}"
+                else:
+                    row["Type / Template"] = "HTTP service"
+            else:
+                # Generic label for other discovery tools
+                if tool_l == "gau":
+                    row["Type / Template"] = "Historical URL"
+                elif tool_l in {"katana", "gospider"}:
+                    row["Type / Template"] = "Crawled endpoint"
+                    # GoSpider often includes status codes inside evidence/log lines
+                    if tool_l == "gospider" and row["Status Code"] == "—":
+                        m = re.search(r"\[?code[-\s]?(\d{3})\]?", raw_evidence_text, flags=re.I)
+                        if m:
+                            row["Status Code"] = m.group(1)
+                    # Also try for Katana if evidence contains code tokens
+                    if tool_l == "katana" and row["Status Code"] == "—":
+                        m = re.search(r"\[?code[-\s]?(\d{3})\]?", raw_evidence_text, flags=re.I)
+                        if m:
+                            row["Status Code"] = m.group(1)
+                elif tool_l in {"subfinder", "amass", "assetfinder", "sublist3r"}:
+                    row["Type / Template"] = "Subdomain discovered"
+                    # Subdomain tools typically output hostnames (no scheme).
+                    # Put that value in URL so the row is not blank.
+                    if location and row["URL"] == "—":
+                        row["URL"] = location
+                elif tool_l == "cewl":
+                    row["Type / Template"] = "Generated wordlist"
+                    if location and row["URL"] == "—" and (location.startswith("http://") or location.startswith("https://")):
+                        row["URL"] = location
+                    if location and row["URL"] == "—":
+                        # CeWL stores location as target hostname; map it to URL column.
+                        row["URL"] = location
+                elif tool_l in {"dnsx", "shuffledns"}:
+                    row["Type / Template"] = "DNS record"
+                    if location and row["URL"] == "—":
+                        row["URL"] = location
+                elif tool_l in {"ffuf", "wfuzz"}:
+                    row["Type / Template"] = "Fuzz result"
+                    # FFuf JSON evidence contains status and url.
+                    if row.get("Status Code", "—") == "—":
+                        sc = evidence.get("status")
+                        if sc is not None and str(sc).strip() != "":
+                            row["Status Code"] = str(sc)
+
+            if ftype == "vulnerability":
+                row["Vulnerability"] = desc if desc else "—"
+                if row["Type / Template"] == "—":
+                    row["Type / Template"] = "Vulnerability"
+
+            # Professional UI: avoid "endless —" columns in Key Findings.
+            # Replace remaining unknown fields with explicit "N/A".
+            for k, v in list(row.items()):
+                if isinstance(v, str) and v.strip() == "—":
+                    row[k] = "N/A"
+
+            key_findings_v2_rows.append(row)
+
+            if len(top_findings) < 20:
+                # Keep this small list for any AI classification / summary needs.
+                top_findings.append({
+                    "tool": getattr(f, "tool_name", None),
+                    "type": ftype,
+                    "severity": sev,
+                    "location": (getattr(f, "location", "") or "")[:200],
+                    "description": desc if len(desc) <= 300 else desc[:300],
+                })
+
+        suppressed = []  # kept for backwards compatibility (no longer used for hard caps)
+        key_findings_note = (
+            "Key Findings shows a complete, deduplicated view of findings. "
+            "See each tool’s Execution Report for the full raw output."
+        )
         
         # Group all findings by severity for clickable severity badges
         seen = set()
@@ -247,12 +712,27 @@ class IntelligenceService:
                     "description": (desc[:200] + "...") if len(desc) > 200 else desc,
                 })
         # Clues summary: what Naabu and Httpx found (so both tools are visible even when one has 0)
-        naabu_count = len([f for f in findings if (f.tool_name or "").lower() == "naabu"])
-        httpx_count = len([f for f in findings if (f.tool_name or "").lower() == "httpx"])
-        clues_summary = f"Initial clues: Naabu {naabu_count} port(s), Httpx {httpx_count} HTTP service(s)."
+        clues = IntelligenceService._extract_clues_from_findings(findings)
+        clues_from_summary = IntelligenceService._extract_clues_from_error_summary(scan.error_summary)
+        for k in clues.keys():
+            for v in clues_from_summary.get(k, []) or []:
+                if v not in clues[k]:
+                    clues[k].append(v)
+        naabu_count = len(clues.get("open_ports", []) or [])
+        httpx_count = len(clues.get("http_services", []) or [])
 
-        # Per-tool severity breakdown: include all completed tools (even 0 findings) so "combined" is clear
-        tools_that_ran = list({tr.tool_name for tr in completed_tools if tr.tool_name})
+        # If target was a URL, it may be pre-added as an HTTP service.
+        target_is_url = scan.target.startswith("http://") or scan.target.startswith("https://")
+        httpx_display_count = httpx_count + (1 if (target_is_url and scan.target not in (clues.get("http_services") or [])) else 0)
+        clues_summary = f"Initial clues: Naabu {naabu_count} port(s), Httpx {httpx_display_count} HTTP service(s)."
+
+        # Per-tool severity breakdown:
+        # Use tools that actually produced findings (includes clue-phase tools like Httpx),
+        # plus any completed tools (even with 0 findings) so "combined" stays accurate.
+        tools_that_ran = sorted({
+            *(str(f.tool_name) for f in findings if getattr(f, "tool_name", None)),
+            *(str(tr.tool_name) for tr in completed_tools if getattr(tr, "tool_name", None)),
+        })
         severity_by_tool = {}
         for tool_name in tools_that_ran:
             severity_by_tool[tool_name] = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
@@ -263,6 +743,9 @@ class IntelligenceService:
         tools_list_for_note = ", ".join(sorted(severity_by_tool.keys())) if severity_by_tool else "N/A"
         severity_combined_note = f"Combined from all tools ({tools_list_for_note})."
 
+        # Use scan's completed_at time if available, otherwise use created_at for immutable timestamp
+        report_timestamp = scan.completed_at if scan.completed_at else scan.created_at
+        
         return {
             "type": "executive_summary",
             "title": "Executive Summary",
@@ -270,7 +753,7 @@ class IntelligenceService:
             "content": {
                 "target": scan.target,
                 "status": scan.status.value,
-                "total_findings": total,
+                "total_findings": display_total,
                 "critical": critical,
                 "high": high,
                 "medium": medium,
@@ -283,12 +766,16 @@ class IntelligenceService:
                 "tools_failed_names": failed_tool_names,
                 "tools_total": len(tool_runs),
                 "top_findings": top_findings,
+                "key_findings_v2_columns": ["Tool (Severity)", "Target", "IP Address", "Port", "Service", "URL", "Status Code", "Technology", "Vulnerability", "Type / Template"],
+                "key_findings_v2_rows": key_findings_v2_rows,
                 "findings_by_severity": findings_by_severity,
                 "clues_summary": clues_summary,
+                "clues": clues,
+                "key_findings_note": key_findings_note,
                 "severity_combined_note": severity_combined_note,
                 "severity_by_tool": severity_by_tool,
             },
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": report_timestamp.isoformat(),
         }
     
     @staticmethod
@@ -339,6 +826,10 @@ class IntelligenceService:
                 "location": f.location,
                 "description": desc,
             })
+        
+        # Use scan's completed_at time if available, otherwise use created_at for immutable timestamp
+        report_timestamp = scan.completed_at if scan.completed_at else scan.created_at
+        
         return {
             "type": "findings_table",
             "title": "All Findings",
@@ -349,7 +840,7 @@ class IntelligenceService:
                 "rows": rows,
                 "severity_info": "Understanding severity: Info = discovery data (open ports, URLs found) that helps map the target, not security flaws. Low = minor issues. Critical/High/Medium = real security problems that need fixing.",
             },
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": report_timestamp.isoformat(),
         }
     
     @staticmethod
@@ -419,6 +910,10 @@ class IntelligenceService:
             for sev in [f.severity.value if hasattr(f.severity, "value") else str(f.severity)]
             if sev in ("critical", "high", "medium")
         )
+        
+        # Use scan's completed_at time if available, otherwise use created_at for immutable timestamp
+        report_timestamp = scan.completed_at if scan.completed_at else scan.created_at
+        
         return {
             "type": "attack_relevance",
             "title": "⚔️ Relevance to Chosen Attack Type",
@@ -431,7 +926,7 @@ class IntelligenceService:
                 "tools_with_findings": tools_with_findings,
                 "detail_bullets": rel.get("detail_bullets", []),
             },
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": report_timestamp.isoformat(),
         }
     
     @staticmethod
@@ -462,33 +957,13 @@ class IntelligenceService:
                 findings_by_type[ftype] = []
             findings_by_type[ftype].append(finding)
         
-        # Get detailed clues data from error_summary
-        clues_data = {}
-        if scan.error_summary:
-            # Extract detailed information from the error summary
-            import re
-            clues_match = re.search(r'Initial Reconnaissance Clues:(.*?)(?:\n\n[^I]|\n\n$|$)', scan.error_summary, re.DOTALL)
-            if clues_match:
-                clues_text = clues_match.group(1)
-                for line in clues_text.split('\n'):
-                    if ':' in line and '- ' in line:
-                        key_val = line.split(':', 1)
-                        if len(key_val) > 1:
-                            key = key_val[0].replace('- ', '').strip()
-                            value = key_val[1].strip()
-                            # Parse different types of values
-                            if value.lower() in ['none detected', 'none', 'null', '[]']:
-                                value = []
-                            elif value.startswith('[') and value.endswith(']'):
-                                try:
-                                    cleaned = value[1:-1].strip()
-                                    if cleaned:
-                                        value = [item.strip().strip("'").strip('"') for item in cleaned.split(',')]
-                                    else:
-                                        value = []
-                                except:
-                                    value = []
-                            clues_data[key.lower().replace(' ', '_')] = value
+        # Clues from summary text + persisted findings (findings may be empty during OWASP-scoped runs)
+        clues_data = IntelligenceService._extract_clues_from_error_summary(scan.error_summary)
+        clues_from_findings = IntelligenceService._extract_clues_from_findings(findings)
+        for k in clues_data.keys():
+            for v in clues_from_findings.get(k, []) or []:
+                if v not in clues_data[k]:
+                    clues_data[k].append(v)
         
         # Extract detailed technical information from findings (with deduplication)
         detailed_findings = []
@@ -529,7 +1004,9 @@ class IntelligenceService:
             detailed_findings.append(finding_detail)
         
         # Calculate statistics
+        # Use persisted findings for the displayed total so it matches the severity sum.
         total_findings = len(findings)
+        display_total_findings = total_findings
         severity_stats = {sev: len(findings_by_severity.get(sev, [])) for sev in ["critical", "high", "medium", "low", "info"]}
         type_stats = {ftype: len(findings_by_type.get(ftype, [])) for ftype in ["vulnerability", "misconfiguration", "information", "port", "endpoint", "asset"]}
         
@@ -634,7 +1111,7 @@ class IntelligenceService:
                 "scan_id": scan.id,
                 "description": f"Reconnaissance analysis for {scan.target}",
                 "statistics": {
-                    "total_findings": total_findings,
+                    "total_findings": display_total_findings,
                     "severity_breakdown": severity_stats,
                     "severity_combined_note": severity_combined_note,
                     "severity_by_tool": severity_by_tool,
@@ -653,7 +1130,8 @@ class IntelligenceService:
                 },
                 "intelligence_insight": intelligence_insight,
             },
-            "timestamp": datetime.utcnow().isoformat(),
+            # Use scan's completed_at time if available, otherwise use created_at for immutable timestamp
+            "timestamp": (scan.completed_at if scan.completed_at else scan.created_at).isoformat(),
         }
     
     @staticmethod
@@ -729,7 +1207,8 @@ class IntelligenceService:
                     "reason": reason,
                 },
             },
-            "timestamp": datetime.utcnow().isoformat(),
+            # Use scan's completed_at time if available, otherwise use created_at for immutable timestamp
+            "timestamp": (scan.completed_at if scan.completed_at else scan.created_at).isoformat(),
         }
     
     @staticmethod
@@ -751,7 +1230,11 @@ class IntelligenceService:
                 "title": f"🔧 {tool_run.tool_name} Execution Report",
                 "icon": "🔧",
                 "content": {
-                    "command": IntelligenceService._get_real_command(tool_run.tool_name, target),
+                    "command": IntelligenceService._get_real_command(
+                        tool_run.tool_name,
+                        target,
+                        owasp_category=scan.owasp_category,
+                    ),
                     "result": {
                         "status": tool_run.status.value,
                         "findings_count": 0,
@@ -760,6 +1243,7 @@ class IntelligenceService:
                     "status": tool_run.status.value,
                     "error_message": tool_run.error_message,
                     "readable_output": readable_output,
+                    "raw_output": IntelligenceService._read_raw_output(getattr(tool_run, "raw_output_path", None)),
                 },
                 "timestamp": (tool_run.finished_at or tool_run.started_at).isoformat() if (tool_run.finished_at or tool_run.started_at) else datetime.utcnow().isoformat(),
             }
@@ -770,17 +1254,57 @@ class IntelligenceService:
         elif tool_name == "naabu":
             return IntelligenceService._generate_port_exposure_report(tool_run, findings, target)
         elif tool_name == "nuclei":
-            return IntelligenceService._generate_vulnerability_report(tool_run, findings, target)
+            return IntelligenceService._generate_vulnerability_report(
+                tool_run,
+                findings,
+                target,
+                owasp_category=scan.owasp_category,
+            )
         elif tool_name == "httpx":
             return IntelligenceService._generate_http_service_report(tool_run, findings, target)
         elif tool_name == "subfinder":
             return IntelligenceService._generate_subdomain_report(tool_run, findings, target)
+        elif tool_name in ("activetest", "activetester"):
+            return IntelligenceService._generate_active_test_report(tool_run, findings, target)
+        elif tool_name == "responseanalyzer":
+            return IntelligenceService._generate_response_analyzer_report(tool_run, findings, target)
         else:
             # Generic tool report - impact and list of findings so frontend can show actual output
             n = len(findings)
-            impact = f"Executed {tool_run.tool_name} reconnaissance. Found {n} {'finding' if n == 1 else 'findings'}." if n > 0 else f"Executed {tool_run.tool_name} reconnaissance. No findings."
+            raw_output = IntelligenceService._read_raw_output(getattr(tool_run, "raw_output_path", None))
+            n_effective = n
+            # Some recon tools can produce very large URL lists; for display accuracy, prefer raw output count
+            # when it clearly exceeds parsed/stored findings (e.g., legacy scans that had a cap).
+            try:
+                tool_l = (tool_run.tool_name or "").strip().lower()
+                if raw_output and tool_l in {"gau", "katana", "gospider"}:
+                    raw_lines = [ln.strip() for ln in raw_output.splitlines() if ln.strip()]
+                    if tool_l == "gospider":
+                        # GoSpider logs often embed URLs within other text; extract URLs via regex.
+                        raw_urls = set()
+                        for ln in raw_lines:
+                            for u in re.findall(r"https?://[^\\s]+", ln):
+                                raw_urls.add(u)
+                        raw_url_count = len(raw_urls)
+                    else:
+                        raw_urls = {
+                            ln
+                            for ln in raw_lines
+                            if ln.startswith("http://") or ln.startswith("https://")
+                        }
+                        raw_url_count = len(raw_urls)
+                    if raw_url_count > n_effective:
+                        n_effective = raw_url_count
+            except Exception:
+                pass
+
+            impact = (
+                f"Executed {tool_run.tool_name} reconnaissance. Found {n_effective} {'finding' if n_effective == 1 else 'findings'}."
+                if n_effective > 0
+                else f"Executed {tool_run.tool_name} reconnaissance. No findings."
+            )
             detected_issues = []
-            readable_output = [f"Findings: {n}"] if n > 0 else ["No findings."]
+            readable_output = [f"Findings: {n_effective}"] if n_effective > 0 else ["No findings."]
             for f in findings[:40]:
                 loc = (f.location or "").strip()
                 if len(loc) > 80:
@@ -799,12 +1323,13 @@ class IntelligenceService:
                 "content": {
                     "command": IntelligenceService._get_real_command(tool_run.tool_name, target),
                     "result": {
-                        "findings_count": n,
+                        "findings_count": n_effective,
                         "status": "completed",
                     },
                     "impact": impact,
                     "detected_issues": detected_issues,
                     "readable_output": readable_output,
+                    "raw_output": raw_output,
                 },
                 "timestamp": tool_run.finished_at.isoformat() if tool_run.finished_at else datetime.utcnow().isoformat(),
             }
@@ -847,6 +1372,7 @@ class IntelligenceService:
                 },
                 "impact": impact.strip(),
                 "readable_output": readable_output,
+                "raw_output": IntelligenceService._read_raw_output(getattr(tool_run, "raw_output_path", None)),
             },
             "timestamp": tool_run.finished_at.isoformat() if tool_run.finished_at else datetime.utcnow().isoformat(),
         }
@@ -913,13 +1439,17 @@ class IntelligenceService:
                 "risk_indicator": risk_level,
                 "impact": impact,
                 "readable_output": readable_output,
+                "raw_output": IntelligenceService._read_raw_output(getattr(tool_run, "raw_output_path", None)),
             },
             "timestamp": tool_run.finished_at.isoformat() if tool_run.finished_at else datetime.utcnow().isoformat(),
         }
     
     @staticmethod
     def _generate_vulnerability_report(
-        tool_run: ToolRun, findings: List[Finding], target: str
+        tool_run: ToolRun,
+        findings: List[Finding],
+        target: str,
+        owasp_category: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Generate vulnerability detection summary (includes info/low so Nuclei info findings are shown)."""
         def _sev(f):
@@ -930,6 +1460,7 @@ class IntelligenceService:
         low_count = len([f for f in findings if _sev(f) == "low"])
         info_count = len([f for f in findings if _sev(f) == "info"])
         
+        tool_name = (getattr(tool_run, "tool_name", "") or "").strip().lower()
         issues = []
         readable_output = []
         for finding in findings[:25]:
@@ -938,16 +1469,46 @@ class IntelligenceService:
             if desc:
                 issues.append(desc)
             sev = _sev(finding)
-            line = f"[{sev.upper()}] {desc}" if desc else f"[{sev.upper()}] {finding.location or 'Finding'}"
-            readable_output.append(line)
+            if tool_name == "nuclei":
+                # Structured lines for beginners + analysts: severity, template, endpoint, matcher.
+                template_id = ""
+                matcher = ""
+                cve = ""
+                try:
+                    ev = json.loads(finding.evidence) if getattr(finding, "evidence", None) else {}
+                    template_id = str(ev.get("template-id") or ev.get("template_id") or "").strip()
+                    matcher = str(ev.get("matcher-name") or "").strip()
+                    cve = str(ev.get("cve-id") or ev.get("cve") or "").strip()
+                except Exception:
+                    pass
+                endpoint = (finding.location or "").strip() or "N/A"
+                parts = [f"[{sev.upper()}]"]
+                if template_id:
+                    parts.append(f"template={template_id}")
+                if cve:
+                    parts.append(f"cve={cve}")
+                parts.append(f"url={endpoint}")
+                if matcher:
+                    parts.append(f"matcher={matcher}")
+                if desc:
+                    parts.append(f"issue={desc}")
+                readable_output.append(" | ".join(parts))
+            else:
+                line = f"[{sev.upper()}] {desc}" if desc else f"[{sev.upper()}] {finding.location or 'Finding'}"
+                readable_output.append(line)
         if not readable_output:
             readable_output = ["No vulnerabilities or info findings reported."]
+        raw_output = None if tool_name == "nuclei" else IntelligenceService._read_raw_output(getattr(tool_run, "raw_output_path", None))
         return {
             "type": "vulnerability",
             "title": "🔧 Vulnerability Detection Summary",
             "icon": "🔧",
             "content": {
-                "command": IntelligenceService._get_real_command(tool_run.tool_name, target),
+                "command": IntelligenceService._get_real_command(
+                    tool_run.tool_name,
+                    target,
+                    owasp_category=owasp_category,
+                ),
                 "findings": {
                     "critical": critical_count,
                     "high": high_count,
@@ -957,10 +1518,93 @@ class IntelligenceService:
                 },
                 "detected_issues": issues,
                 "readable_output": readable_output,
+                "raw_output": raw_output,
             },
             "timestamp": tool_run.finished_at.isoformat() if tool_run.finished_at else datetime.utcnow().isoformat(),
         }
-    
+
+    @staticmethod
+    def _generate_active_test_report(
+        tool_run: ToolRun, findings: List[Finding], target: str
+    ) -> Dict[str, Any]:
+        """Generate Active Testing report for all OWASP categories."""
+        def _sev(f):
+            return f.severity.value if hasattr(f.severity, "value") else str(f.severity)
+        high = len([f for f in findings if _sev(f) == "high"])
+        critical = len([f for f in findings if _sev(f) == "critical"])
+        medium = len([f for f in findings if _sev(f) == "medium"])
+        low = len([f for f in findings if _sev(f) == "low"])
+        readable_output = []
+        for f in findings[:20]:
+            sev = _sev(f).upper()
+            loc = (f.location or "").strip()
+            desc = (f.description or "").strip()
+            readable_output.append(f"[{sev}] {loc} — {desc}")
+        if not readable_output:
+            readable_output = ["No findings from Active Testing."]
+        impact = f"Active Testing: {len(findings)} finding(s)." if findings else "No findings from Active Testing."
+        return {
+            "type": "vulnerability",
+            "title": "🔧 Active Testing Report",
+            "icon": "🔧",
+            "content": {
+                "command": "Active Testing Engine — OWASP-specific HTTP request tests",
+                "findings": {"critical": critical, "high": high, "medium": medium, "low": low, "info": 0},
+                "impact": impact,
+                "detected_issues": [f.description or f.location for f in findings[:20]],
+                "readable_output": readable_output,
+                "raw_output": None,
+            },
+            "timestamp": tool_run.finished_at.isoformat() if tool_run.finished_at else datetime.utcnow().isoformat(),
+        }
+
+    @staticmethod
+    def _generate_response_analyzer_report(
+        tool_run: ToolRun, findings: List[Finding], target: str
+    ) -> Dict[str, Any]:
+        """Report for ResponseAnalyzer findings (post–active-test response parsing)."""
+        def _sev(f):
+            return f.severity.value if hasattr(f.severity, "value") else str(f.severity)
+
+        high = len([f for f in findings if _sev(f) == "high"])
+        critical = len([f for f in findings if _sev(f) == "critical"])
+        medium = len([f for f in findings if _sev(f) == "medium"])
+        low = len([f for f in findings if _sev(f) == "low"])
+        info = len([f for f in findings if _sev(f) == "info"])
+        readable_output = []
+        for f in findings[:40]:
+            sev = _sev(f).upper()
+            loc = (f.location or "").strip()
+            desc = (f.description or "").strip()
+            readable_output.append(f"[{sev}] {loc} — {desc}")
+        if not readable_output:
+            readable_output = ["No Response Analyzer findings."]
+        impact = (
+            f"Response Analysis: {len(findings)} finding(s) from response indicators."
+            if findings
+            else "No Response Analyzer findings."
+        )
+        return {
+            "type": "vulnerability",
+            "title": "🔧 Response Analysis Report",
+            "icon": "🔧",
+            "content": {
+                "command": "Response Analysis — parsing active test responses for vulnerability indicators",
+                "findings": {
+                    "critical": critical,
+                    "high": high,
+                    "medium": medium,
+                    "low": low,
+                    "info": info,
+                },
+                "impact": impact,
+                "detected_issues": [f.description or f.location for f in findings[:40]],
+                "readable_output": readable_output,
+                "raw_output": None,
+            },
+            "timestamp": tool_run.finished_at.isoformat() if tool_run.finished_at else datetime.utcnow().isoformat(),
+        }
+
     @staticmethod
     def _generate_http_service_report(
         tool_run: ToolRun, findings: List[Finding], target: str
@@ -1008,6 +1652,7 @@ class IntelligenceService:
                 "impact": impact.strip(),
                 "detected_issues": detected_issues,
                 "readable_output": readable_output,
+                "raw_output": IntelligenceService._read_raw_output(getattr(tool_run, "raw_output_path", None)),
             },
             "timestamp": tool_run.finished_at.isoformat() if tool_run.finished_at else datetime.utcnow().isoformat(),
         }
@@ -1017,22 +1662,41 @@ class IntelligenceService:
         tool_run: ToolRun, findings: List[Finding], target: str
     ) -> Dict[str, Any]:
         """Generate subdomain enumeration report with beginner-friendly output lines."""
-        subdomain_count = len(findings)
-        dev_subdomains = len([f for f in findings if any(keyword in (f.location or "").lower() for keyword in ["dev", "staging", "test", "admin"])])
-        mail_subdomains = len([f for f in findings if "mail" in (f.location or "").lower() or "smtp" in (f.location or "").lower()])
+        raw_output = IntelligenceService._read_raw_output(getattr(tool_run, "raw_output_path", None))
+        target_l = (target or "").strip().lower()
+
+        # Prefer persisted findings, but fallback to parsed raw output so report wording matches tool output.
+        discovered_from_findings = {
+            (f.location or "").strip().lower()
+            for f in findings
+            if (f.location or "").strip()
+        }
+        discovered_from_raw = set()
+        if raw_output and target_l:
+            patt = re.compile(rf"\b(?:[a-zA-Z0-9-]+\.)+{re.escape(target_l)}\b", re.IGNORECASE)
+            for line in raw_output.splitlines():
+                s = (line or "").strip().lower()
+                if not s or s.startswith("==="):
+                    continue
+                for m in patt.findall(s):
+                    if m and m != target_l:
+                        discovered_from_raw.add(m)
+
+        discovered = discovered_from_findings or discovered_from_raw
+        subdomain_count = len(discovered)
+        dev_subdomains = len([d for d in discovered if any(keyword in d for keyword in ["dev", "staging", "test", "admin"])])
+        mail_subdomains = len([d for d in discovered if "mail" in d or "smtp" in d])
         impact = "No subdomains discovered." if subdomain_count == 0 else f"Discovered {subdomain_count} subdomain(s)."
         if dev_subdomains > 0:
             impact += f" {dev_subdomains} development/staging subdomain(s)."
         if mail_subdomains > 0:
             impact += f" {mail_subdomains} mail-related subdomain(s)."
         readable_output = [f"Total subdomains: {subdomain_count}", f"Development/staging: {dev_subdomains}", f"Mail-related: {mail_subdomains}"]
-        for f in findings[:50]:
-            loc = (f.location or "").strip()
-            if loc:
-                readable_output.append(f"Discovered: {loc}")
+        for loc in sorted(discovered)[:50]:
+            readable_output.append(f"Discovered: {loc}")
         if subdomain_count == 0:
             readable_output = ["No subdomains discovered."]
-        detected_issues = [f.location or "" for f in findings[:50]]
+        detected_issues = sorted(discovered)[:50]
         return {
             "type": "subdomain",
             "title": "🔧 Subdomain Enumeration Report",
@@ -1047,6 +1711,7 @@ class IntelligenceService:
                 "impact": impact.strip(),
                 "detected_issues": detected_issues,
                 "readable_output": readable_output,
+                "raw_output": raw_output,
             },
             "timestamp": tool_run.finished_at.isoformat() if tool_run.finished_at else datetime.utcnow().isoformat(),
         }
@@ -1215,5 +1880,6 @@ class IntelligenceService:
                     "remediation_timeline": actionable_result.get("remediation_timeline", {}),
                 }
             },
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": scan.created_at.isoformat() if scan.created_at else datetime.utcnow().isoformat(),
         }
+        

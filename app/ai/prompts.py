@@ -19,6 +19,18 @@ TOOL_DESCRIPTIONS = {
     "DNSx": "Fast DNS toolkit for DNS enumeration and validation. Important for A05, A10.",
     "ShuffleDNS": "Subdomain bruteforcer with wildcard detection. Useful when passive methods are insufficient."
 }
+OWASP_NUCLEI_TAGS = {
+  "A01:2021": "unauth,traversal,lfi,idor,redirect",
+  "A02:2021": "ssl,tls,expired-ssl,certificate",
+  "A03:2021": "sqli,xss,command-injection,ssti,xxe",
+  "A04:2021": "logic-bypass,auth-bypass,access-control,misconfig",
+  "A05:2021": "misconfig,cors,headers,exposure",
+  "A06:2021": "cve,known-vuln,version-detect,outdated",
+  "A07:2021": "default-login,auth-bypass,jwt,login",
+  "A08:2021": "deserialization,file-upload,xxe,path-traversal",
+  "A09:2021": "log4j,logging,exposure,debug-page",
+  "A10:2021": "ssrf,graphql",
+}
 
 
 def build_decision_prompt(
@@ -44,6 +56,8 @@ def build_decision_prompt(
         [f"- {tool}: {desc}" for tool, desc in TOOL_DESCRIPTIONS.items()]
     )
 
+    nuclei_tags = OWASP_NUCLEI_TAGS.get(owasp_category, "misconfig,security-headers")
+
     clues_summary = f"""
 Initial Reconnaissance Clues:
 - Open Ports: {clues.get('open_ports', 'None detected')}
@@ -52,14 +66,19 @@ Initial Reconnaissance Clues:
 - Page Titles: {clues.get('page_titles', 'None detected')}
 - Status Codes: {clues.get('status_codes', 'None detected')}
 - Technologies Detected: {clues.get('technologies', 'None detected')}
+- Discovered URLs: {clues.get('discovered_urls', 'None yet')}
+- Subdomains Found: {clues.get('subdomains', 'None yet')}
 """
 
     selected_tools_str = ", ".join(selected_tools) if selected_tools else "All tools available"
 
-    prompt = f"""You are an expert security reconnaissance AI helping to optimize tool selection for OWASP Top 10 security assessments.
+    prompt = f"""You are a senior application security recon analyst optimizing tool selection for OWASP {owasp_category} ({owasp_name}) assessments.
 
 ## Mission
-Analyze the target and initial reconnaissance clues to decide which security tools should be executed for maximum efficiency and relevance.
+Produce a professional, evidence-driven execution plan that:
+1) expands target intelligence with high-signal reconnaissance,
+2) minimizes redundant/no-output tools,
+3) improves vulnerability detection probability for Nuclei.
 
 ## Target Information
 - Domain: {target}
@@ -72,10 +91,11 @@ Analyze the target and initial reconnaissance clues to decide which security too
 {tools_list}
 
 ## Your Task
-Based on the target, OWASP category, user selections, and initial clues, decide:
-1. Which tools are most relevant and should run
-2. Which tools should be skipped and why
-3. Optional: Suggest execution order/batches for parallel execution
+Based on the target, OWASP category, user selections, and clues, decide:
+1. Which tools should run to improve vulnerability discovery
+2. Which user-selected tools should be skipped and why
+3. Which additional tools should be added and why
+4. Execution sequence that is recon-first and vulnerability-focused
 
 ## Decision Rules
 1. ONLY use tool names from the list above - never invent new names.
@@ -90,6 +110,32 @@ Based on the target, OWASP category, user selections, and initial clues, decide:
    - If the target has many subdomains, add crawlers and fuzzers.
 6. Match tools to the OWASP category focus.
 7. Respect user's initial selection - don't replace it, enhance it.
+8. For web targets, keep Nuclei in the plan unless clues clearly show no reachable HTTP(S) surface.
+9. Prioritize tools that increase URL/endpoint coverage before Nuclei (for better template match opportunities).
+
+## Professional Strategy Priority (Recon -> Enrichment -> Vulnerability)
+Use this default strategy unless clues strongly justify otherwise:
+1. Surface discovery: identify active hosts/services (Naabu/Httpx already handled in clues for dashboard flow).
+2. URL enrichment: run one or more of GAU/Katana/GoSpider/FFuf/Wfuzz only when HTTP surface exists.
+3. Vulnerability detection: run Nuclei after URL enrichment so it can test more relevant endpoints.
+
+## Nuclei Tag Recommendation for {owasp_category}
+When Nuclei is in the plan, prefer these tags: {nuclei_tags}
+
+When providing execution_batches, place reconnaissance/enrichment tools earlier and Nuclei in a later batch.
+
+## Tool Availability and Prioritization Policy
+- Do NOT use fixed tool bundles or hardcoded named combinations.
+- First, inspect only the tools shown in "Available Tools" above.
+- Build recommendations strictly from that available list and the user's selected list.
+- Prioritize by capability categories instead of fixed names:
+  1) Asset/service discovery
+  2) URL/endpoint enrichment
+  3) Fuzzing/content discovery
+  4) Vulnerability detection
+- For the chosen OWASP category, rank available tools by expected signal quality given current clues.
+- If a category has multiple available tools with overlapping capability, choose the highest-signal subset and skip redundant ones.
+- If a required capability category is missing from available tools, continue with best possible alternatives and explain the gap in reasoning.
 
 ## Avoid tools that find nothing (CRITICAL)
 Many tools often return ZERO findings for typical targets. Do not recommend a long list when clues are minimal:
@@ -101,7 +147,7 @@ Many tools often return ZERO findings for typical targets. Do not recommend a lo
 ## Tool Output Requirements (CRITICAL - avoid tools that won't produce output)
 Only recommend tools when their required inputs are available. Otherwise they run but produce no useful output:
 - GAU, Katana, GoSpider, FFuf, Wfuzz: Require discovered URLs or HTTP services. SKIP these when clues show "None detected" for HTTP Services and no URLs exist yet.
-- Nuclei: Works best with at least one URL. Can run with base URL if Httpx/Naabu found a web port.
+- Nuclei: Works best with broad URL coverage. Prefer after URL discovery/enrichment tools when available; otherwise run against base URL if web service exists.
 - Subfinder, Amass, Assetfinder, Sublist3r: Require a valid domain. Run at most one or two; skip if target is IP-only.
 - Naabu, Httpx: Can run with just target/domain - these produce output. Always include when relevant.
 - DNSx, ShuffleDNS: Need domain. Often redundant with Subfinder/Amass—skip unless you need DNS validation only.

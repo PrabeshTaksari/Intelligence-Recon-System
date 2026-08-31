@@ -73,6 +73,7 @@ async def mark_scan_as_saved(
     scan = result.scalar_one()
 
     # Mark the scan as saved
+    scan.is_saved = True
     if scan.error_summary:
         if "SAVED_SCAN" not in scan.error_summary:
             scan.error_summary = scan.error_summary + " | SAVED_SCAN"

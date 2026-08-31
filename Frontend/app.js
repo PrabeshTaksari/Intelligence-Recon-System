@@ -21,13 +21,25 @@ const API_ROUTES = {
 // Initialize API config from backend on page load; also update apiBase so requests use correct URL
 async function initializeApiConfig() {
   try {
-    const configUrl = `${defaultApiBase}/api/config`;
-    const response = await fetch(configUrl);
+    // Use relative fetch so it always stays same-origin (works in internal/external browsers).
+    const response = await fetch("/api/config");
     if (response.ok) {
       const config = await response.json();
-      defaultApiBase = config.api_base_url;
-      apiBase = config.api_base_url;
-      console.log("✓ API Config loaded from backend:", apiBase);
+      // Only update apiBase if backend returns something compatible with the current origin.
+      // Otherwise, keep the safe same-origin default (prevents 127.0.0.1/localhost from breaking external browsers).
+      try {
+        const curOrigin = (window.location.origin || "").replace(/\/$/, "");
+        const cfgOrigin = (config.api_base_url || "").replace(/\/$/, "");
+        if (curOrigin && cfgOrigin && curOrigin === cfgOrigin) {
+          defaultApiBase = config.api_base_url;
+          apiBase = config.api_base_url;
+          console.log("✓ API Config loaded from backend:", apiBase);
+        } else {
+          apiBase = defaultApiBase;
+        }
+      } catch (_) {
+        apiBase = defaultApiBase;
+      }
     }
   } catch (error) {
     console.warn("⚠ Could not fetch API config from backend, using same-origin:", defaultApiBase);
@@ -36,6 +48,9 @@ async function initializeApiConfig() {
 }
 
 // Config is loaded in initApp() before any API calls
+
+// Track whether the user is currently manually scrolling in summary panel
+let isUserScrolling = false;
 
 // Tools & OWASP
 const TOOL_LIST = [
@@ -79,18 +94,19 @@ let apiBase = defaultApiBase;
 let trendChart;
 let severityChart;
 /* ===== LIVE STATUS TRACKER – State (per Implementation Overview) =====
- * Data flow: Scan Launch → addLiveStatusItem() → startStatusPolling() + connectSSE()
- *            → Polling (every 5s) + SSE/WebSocket events
- *            → addLiveStatusItem() / handleWebSocketMessage()
+ * Data flow: Scan Launch → addLiveStatusItem() → startStatusPolling()
+ *            → Polling (every 5s)
  *            → renderLiveStatus() → Updates #liveStatusList in the DOM
  * Polling: primary source (GET /api/scans/{id}/status every 5s)
- * SSE: optional real-time (EventSource /api/sse/scan/{id})
+ * SSE: disabled because the backend does not expose an SSE route
  */
 let liveStatus = [];              // Rolling snapshot list (max 6 updates)
 let statusPollingIntervals = {}; // Per-scan polling intervals
 let commandTracking = {};        // Per-tool command/output tracking
+let fallbackNotificationsShown = {}; // Track fallback alerts by scanId
 const LIVE_STATUS_UPDATE_INTERVAL_MS = 5000; // Throttle: only show updates every 5 seconds
 const lastLiveStatusUpdateByScan = {};       // scanId -> timestamp
+const lastLiveStatusDisplayTimeByScan = {};  // scanId -> displayed timestamp
 
 // Initialize liveStatus with OWASP category field
 liveStatus.forEach(item => {
@@ -99,7 +115,7 @@ liveStatus.forEach(item => {
   }
 });
 
-// WebSocket connection for real-time updates
+// EventSource placeholder retained for compatibility with older code paths.
 let eventSource = null;
 let currentScanId = null;
 
@@ -113,14 +129,88 @@ let activeTheme = (() => {
 let lastScanId = null;
 let scanSummaryInterval = null;
 
+function createOrUpdateProgressWidget(scanId, progressPercent, statusText) {
+  let widget = document.getElementById('scanProgressWidget');
+  if (!widget) {
+    widget = document.createElement('div');
+    widget.id = 'scanProgressWidget';
+    widget.innerHTML = `
+      <div class="scan-progress-ring" data-percent="${progressPercent}">
+        <svg viewBox="0 0 36 36" class="circular-chart" aria-hidden="true">
+          <path class="circle-bg" d="M18 2.0845
+              a 15.9155 15.9155 0 0 1 0 31.831
+              a 15.9155 15.9155 0 0 1 0 -31.831" />
+          <path class="circle" stroke-dasharray="${progressPercent},100" d="M18 2.0845
+              a 15.9155 15.9155 0 0 1 0 31.831
+              a 15.9155 15.9155 0 0 1 0 -31.831" />
+        </svg>
+        <span class="scan-progress-label">${progressPercent}%</span>
+      </div>
+      <div class="scan-progress-text">${statusText || 'Running'}</div>
+    `;
+    document.body.appendChild(widget);
+    initProgressWidgetDrag(widget);
+  }
+  const ring = widget.querySelector('.scan-progress-ring');
+  if (ring) {
+    ring.dataset.percent = progressPercent;
+    const path = ring.querySelector('.circle');
+    if (path) {
+      path.setAttribute('stroke-dasharray', `${progressPercent},100`);
+    }
+  }
+  const label = widget.querySelector('.scan-progress-label');
+  if (label) label.textContent = `${progressPercent}%`;
+  const text = widget.querySelector('.scan-progress-text');
+  if (text) text.textContent = statusText || 'Running';
+}
+
+function removeProgressWidget() {
+  const widget = document.getElementById('scanProgressWidget');
+  if (widget) {
+    widget.remove();
+  }
+}
+
+function initProgressWidgetDrag(widget) {
+  let isDragging = false;
+  let offsetX = 0;
+  let offsetY = 0;
+
+  widget.addEventListener('mousedown', (e) => {
+    isDragging = true;
+    widget.style.cursor = 'grabbing';
+    offsetX = e.clientX - widget.getBoundingClientRect().left;
+    offsetY = e.clientY - widget.getBoundingClientRect().top;
+    document.body.style.userSelect = 'none';
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    if (!isDragging) return;
+    const x = Math.max(10, Math.min(window.innerWidth - widget.offsetWidth - 10, e.clientX - offsetX));
+    const y = Math.max(10, Math.min(window.innerHeight - widget.offsetHeight - 10, e.clientY - offsetY));
+    widget.style.left = `${x}px`;
+    widget.style.top = `${y}px`;
+  });
+
+  window.addEventListener('mouseup', () => {
+    if (!isDragging) return;
+    isDragging = false;
+    widget.style.cursor = 'grab';
+    document.body.style.userSelect = '';
+  });
+}
+
 const SEVERITY_KEYS = ["critical", "high", "medium", "low", "info"];
 
 /* ===== HELPERS ===== */
 function getApiUrl(path) {
-  const base = (apiBase || "").replace(/\/$/, "");
-  if (typeof window !== "undefined" && window.location && base === window.location.origin)
-    return path;
-  return (base || window.location.origin) + path;
+  // Always use same-origin relative API URLs to prevent host mismatch
+  // (e.g., internal works on localhost/127.0.0.1 but external uses 0.0.0.0).
+  if (!path) return path;
+  if (String(path).startsWith("http://") || String(path).startsWith("https://")) return path;
+  if (String(path).startsWith("/")) return path;
+  return (apiBase || window.location.origin) + "/" + path;
 }
 
 async function apiRequest(path, options = {}) {
@@ -128,7 +218,23 @@ async function apiRequest(path, options = {}) {
   const resp = await fetch(url, options);
   if (!resp.ok) {
     const text = await resp.text();
-    throw new Error(`API ${resp.status}: ${text}`);
+    // Try to parse JSON error response to extract detail field
+    try {
+      const errorData = JSON.parse(text);
+      // Extract only the detail/message value, nothing else
+      const detail = errorData.detail || errorData.message;
+      if (detail) {
+        throw new Error(detail);
+      } else {
+        throw new Error(text);
+      }
+    } catch (e) {
+      // If not JSON or no detail field, use the raw text
+      if (e instanceof Error && e.message !== text) {
+        throw e;
+      }
+      throw new Error(text);
+    }
   }
   const contentType = resp.headers.get("content-type") || "";
   if (contentType.includes("application/json")) {
@@ -141,46 +247,12 @@ async function apiRequest(path, options = {}) {
  * EventSource /api/sse/scan/{id} - messages dispatched to handleWebSocketMessage
  */
 function connectSSE(scanId) {
-  // Close existing connection
   if (eventSource) {
     eventSource.close();
+    eventSource = null;
   }
-  
-  // Create new SSE connection
-  const sseUrl = `${window.location.protocol}//${window.location.host}/api/sse/scan/${scanId}`;
-  
-  console.log(`Attempting to connect SSE to: ${sseUrl}`);
-  
-  try {
-    eventSource = new EventSource(sseUrl);
-    
-    eventSource.onopen = function(event) {
-      console.log(`SSE connected for scan ${scanId}`);
-      currentScanId = scanId;
-    };
-    
-    eventSource.onmessage = function(event) {
-      console.log("SSE message received:", event.data);
-      try {
-        const message = JSON.parse(event.data);
-        console.log("Parsed SSE message:", message);
-        handleWebSocketMessage(message); // Reuse existing message handler
-      } catch (e) {
-        console.error("Failed to parse SSE message:", e);
-      }
-    };
-    
-    eventSource.onerror = function(error) {
-      console.error("SSE error:", error);
-      console.error("SSE URL was:", sseUrl);
-      eventSource.close();
-      if (currentScanId === scanId) {
-        currentScanId = null;
-      }
-    };
-  } catch (e) {
-    console.error("Failed to create SSE connection:", e);
-  }
+  currentScanId = scanId;
+  console.debug(`SSE is disabled; using polling for scan ${scanId}`);
 }
 
 function disconnectSSE() {
@@ -423,6 +495,7 @@ function handleToolComplete(message) {
       // Update the scan status to completed
       scanItem.status = "completed";
       scanItem.phase = "All tools finished. Scan completed.";
+      removeProgressWidget();
       
       // Keep WebSocket connection open to show final status
       // WebSocket will be disconnected when user navigates away or manually closes
@@ -509,6 +582,11 @@ function isValidTarget(raw) {
   const domain =
     /^(?=.{3,255}$)([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$/;
   if (domain.test(value)) return true;
+
+  // Hostname or local host with optional port (localhost, localhost:3000, 127.0.0.1:8080, [::1]:8080)
+  const hostWithPort =
+    /^(?:\[(?:[0-9a-fA-F:]+)\]|[a-zA-Z0-9.-]+)(?::\d{1,5})?$/;
+  if (hostWithPort.test(value)) return true;
 
   return false;
 }
@@ -990,6 +1068,9 @@ async function handleLaunchScan(evt) {
       } catch (_) {
         showStyledPopup("Another scan is still running. Please wait for it to complete before starting a new one.");
       }
+    } else if (msg) {
+      // Show backend error message (e.g., "Wrong Domain")
+      help.textContent = msg;
     } else {
       help.textContent = "Failed to launch scan. Check backend or API base URL.";
     }
@@ -1070,11 +1151,11 @@ function deriveScanPhase(status, tools, phaseInfo = null) {
  * - Polling: startStatusPolling (every 5s) via GET /api/scans/{id}/status
  * - SSE/WebSocket: handleToolStart, handleToolOutput, handleToolComplete, handleInitialStatus, handleScanPhaseUpdate, handleLogMessage
  */
-function addLiveStatusItem({ scanId, target, status, tools = [], phase, owaspCategory, serverTimestamp, phaseInfo = null, fromPolling = false }) {
+function addLiveStatusItem({ scanId, target, status, tools = [], phase, owaspCategory, serverTimestamp, phaseInfo = null, fallbackActive = false, fromPolling = false }) {
   const statusLower = (status || "").toLowerCase();
   const isCompleted = statusLower === "completed" || statusLower === "completed_with_errors";
 
-  // Once a scan is completed, show only one row: do not add any more updates for this scan
+  // Once a scan is completed, show only one row: do not add any more completed updates for this scan
   if (isCompleted) {
     const alreadyHasCompleted = liveStatus.some(
       (item) => item.scanId === scanId && ((item.status || "").toLowerCase() === "completed" || (item.status || "").toLowerCase() === "completed_with_errors")
@@ -1089,6 +1170,12 @@ function addLiveStatusItem({ scanId, target, status, tools = [], phase, owaspCat
   if (!fromPolling && !isFinal && !intervalOk) return;
   lastLiveStatusUpdateByScan[scanId] = now;
 
+  const sourceTime = serverTimestamp ? (parseDateAsUTC(serverTimestamp) || new Date()) : new Date();
+  const displayTime = lastLiveStatusDisplayTimeByScan[scanId]
+    ? new Date(lastLiveStatusDisplayTimeByScan[scanId].getTime() + LIVE_STATUS_UPDATE_INTERVAL_MS)
+    : sourceTime;
+  lastLiveStatusDisplayTimeByScan[scanId] = displayTime;
+
   console.log("addLiveStatusItem called with:", { scanId, target, status, tools, phase, owaspCategory, serverTimestamp, phaseInfo });
   console.log("Current liveStatus before update:", liveStatus);
 
@@ -1100,7 +1187,7 @@ function addLiveStatusItem({ scanId, target, status, tools = [], phase, owaspCat
     finished_at: tool.finished_at || null,
   }));
 
-  const newEntry = {
+  const baseEntry = {
     scanId,
     target: target || "",
     status: status || "running",
@@ -1108,15 +1195,17 @@ function addLiveStatusItem({ scanId, target, status, tools = [], phase, owaspCat
     owaspCategory,
     phase: phase || deriveScanPhase(status, cleanTools, phaseInfo),
     phaseInfo: phaseInfo,
+    fallbackActive: fallbackActive || false,
     phaseHistory: phaseInfo ? [{ phase: phaseInfo.currentPhase, timestamp: new Date(), ...phaseInfo }] : [],
-    updatedAt: new Date(),
+    createdAt: displayTime,
+    updatedAt: displayTime,
   };
 
-  // Keep all slices for this scan (do not remove previous phases when completed)
-  liveStatus.unshift(newEntry);
+  liveStatus.unshift(baseEntry);
   liveStatus = liveStatus.slice(0, 6);
+
   console.log("Current liveStatus after update:", liveStatus);
-  
+
   // Use requestAnimationFrame to prevent UI blocking
   requestAnimationFrame(() => {
     renderLiveStatus();
@@ -1165,7 +1254,12 @@ function renderLiveStatus() {
 
     const badgeClass = badgeLabel === "completed" ? "badge-completed" : badgeLabel === "failed" ? "badge-failed" : "badge-running";
     const owaspName = item.owaspCategory ? getOwaspCategoryName(item.owaspCategory) : "";
-    const timeStr = item.updatedAt ? formatCurrentTime(item.updatedAt) : "just now";
+    // Per snapshot: show when this row was captured (poll/SSE), not scan created_at — otherwise every 5s row looks identical
+    const timeStr = item.updatedAt
+      ? formatCurrentTime(item.updatedAt)
+      : item.createdAt
+        ? formatCurrentTime(item.createdAt)
+        : "just now";
 
     let statusDesc = "";
     if (scanStatus === "completed" || scanStatus === "completed_with_errors") {
@@ -1204,21 +1298,27 @@ function renderLiveStatus() {
       toolsDisplay = `Tools: ${toolNames}`;
     }
 
+    const titleText = item.scanId
+      ? `Scan #${item.scanId}${item.target ? ` · ${escapeHtml(item.target)}` : ""}`
+      : escapeHtml(item.target || "");
+
     const li = document.createElement("li");
     li.className = "status-item";
     li.innerHTML = `
       <div class="status-item-body">
-        <div style="font-weight: 600; color: #f9fafb; font-size: 14px; margin-bottom: 4px;">
-          Scan #${item.scanId}${item.target ? ` · <span style="color: #93c5fd;">${item.target}</span>` : ""}
+        <div class="status-header">
+          <div>
+            ${titleText ? `<div class="status-title">${titleText}</div>` : ""}
+            ${owaspName ? `<div class="status-subtitle">OWASP: ${escapeHtml(owaspName)}</div>` : ""}
+          </div>
+          <span class="status-item-badge ${badgeClass}">${badgeLabel}</span>
         </div>
-        ${owaspName ? `<div style="font-size: 12px; color: #64748b; margin-bottom: 2px;">OWASP: ${owaspName}</div>` : ""}
-        ${statusDesc ? `<div style="font-size: 12px; color: #cbd5e1; margin-bottom: 2px;">${statusDesc}</div>` : ""}
-        ${toolsDisplay ? `<div style="font-size: 12px; color: #cbd5e1; margin-bottom: 2px;">${toolsDisplay}</div>` : ""}
-        <div style="font-size: 11px; color: #64748b;">Updated ${timeStr}</div>
+        ${statusDesc ? `<div style="font-size: 12px; color: #cbd5e1; margin-top: 6px;">${statusDesc}</div>` : ""}
+        ${toolsDisplay ? `<div style="font-size: 12px; color: #cbd5e1; margin-top: 6px;">${toolsDisplay}</div>` : ""}
+        <div style="font-size: 11px; color: #64748b; margin-top: 8px;">Updated ${timeStr}</div>
       </div>
-      <span class="status-item-badge ${badgeClass}" style="border-radius: 9999px;">${badgeLabel}</span>
     `;
-    
+
     list.appendChild(li);
   });
 }
@@ -1245,8 +1345,7 @@ function isSublist3rNoiseRow(r) {
 }
 
 function formatDateTimeWithSeconds(date) {
-  // Use the provided date (historical snapshot) when formatting.
-  const d = date ? new Date(date) : new Date();
+  const d = date ? parseDateAsUTC(date) : new Date();
   const hours = d.getHours().toString().padStart(2, '0');
   const minutes = d.getMinutes().toString().padStart(2, '0');
   const seconds = d.getSeconds().toString().padStart(2, '0');
@@ -1254,8 +1353,7 @@ function formatDateTimeWithSeconds(date) {
 }
 
 function formatCurrentTime(date) {
-  // Format the provided date (if any) using friendly AM/PM display.
-  const d = date ? new Date(date) : new Date();
+  const d = date ? parseDateAsUTC(date) : new Date();
   let hours = d.getHours();
   const minutes = d.getMinutes().toString().padStart(2, '0');
   const seconds = d.getSeconds().toString().padStart(2, '0');
@@ -1270,16 +1368,24 @@ function formatCurrentTime(date) {
 function startStatusPolling(scanId) {
   // Clear any existing interval for this scanId
   if (statusPollingIntervals[scanId]) {
-    clearInterval(statusPollingIntervals[scanId]);
+    clearTimeout(statusPollingIntervals[scanId]);
   }
   
   // Track retry attempts
   let retryCount = 0;
   const maxRetries = 3;
-  
-  const interval = setInterval(async () => {
+
+  const pollIntervalMs = 5000;
+  let nextPollAt = Date.now();
+
+  const poll = async () => {
+    nextPollAt += pollIntervalMs;
     try {
-      const data = await apiRequest(API_ROUTES.scanStatus(scanId), { method: "GET" });
+      const pollTimestamp = new Date(nextPollAt - pollIntervalMs);
+      const data = await apiRequest(API_ROUTES.scanStatus(scanId), {
+        method: "GET",
+        cache: "no-store"
+      });
       
       // Reset retry count on successful request
       retryCount = 0;
@@ -1289,6 +1395,7 @@ function startStatusPolling(scanId) {
       const tools = data.tools || [];
       const phaseInfo = data.phase ? { currentPhase: data.phase } : null;
       const phase = deriveScanPhase(status, tools, phaseInfo);
+      const fallbackActive = Boolean(data.ai_fallback_active);
 
       addLiveStatusItem({
         scanId,
@@ -1297,13 +1404,22 @@ function startStatusPolling(scanId) {
         tools,
         phase,
         phaseInfo,
+        fallbackActive,
         owaspCategory: data.owasp_category_name || data.owasp_category,
-        serverTimestamp: data.updated_at || data.completed_at,
+        serverTimestamp: pollTimestamp,
         fromPolling: true
       });
 
+      if (fallbackActive && !fallbackNotificationsShown[scanId]) {
+        fallbackNotificationsShown[scanId] = true;
+        showNotification(
+          "AI fallback mode active: using safe default tool set for this scan.",
+          "warning"
+        );
+      }
+
       if (status === "completed" || status === "completed_with_errors" || status === "failed") {
-        clearInterval(interval);
+        clearTimeout(statusPollingIntervals[scanId]);
         delete statusPollingIntervals[scanId]; // Clean up the interval tracker
         
         // Auto-refresh scans table and update charts with latest findings
@@ -1324,7 +1440,7 @@ function startStatusPolling(scanId) {
       // If we've exceeded max retries, stop polling
       if (retryCount >= maxRetries) {
         console.warn(`Max retries exceeded for scan ${scanId}, stopping polling`);
-        clearInterval(interval);
+        clearTimeout(statusPollingIntervals[scanId]);
         delete statusPollingIntervals[scanId];
         return;
       }
@@ -1336,10 +1452,14 @@ function startStatusPolling(scanId) {
       // Don't clear interval on error - just retry silently
       // The interval will continue and retry automatically
     }
-  }, 5000);
+    if (statusPollingIntervals[scanId]) {
+      const delay = Math.max(0, nextPollAt - Date.now());
+      statusPollingIntervals[scanId] = setTimeout(poll, delay);
+    }
+  };
   
   // Store the interval ID for this scan
-  statusPollingIntervals[scanId] = interval;
+  statusPollingIntervals[scanId] = setTimeout(poll, pollIntervalMs);
 }
 
 function startScanSummaryPolling(scanId) {
@@ -1362,7 +1482,7 @@ function startScanSummaryPolling(scanId) {
         <div class="summary-placeholder-subtext">Summary will update as the scan runs.</div>
       </div>`;
     container.dataset.scanId = String(scanId);
-    delete container.dataset.createdAt;
+    delete container.dataset.reportTimestamp;
   }
   
   // Show live status indicator
@@ -1374,13 +1494,31 @@ function startScanSummaryPolling(scanId) {
   } else {
     console.warn("Status badge not found");
   }
+
+  // Create or update progress widget (initially 0%)
+  createOrUpdateProgressWidget(scanId, 0, 'Starting');
+  
+  // Update dropdown to show this scan if available
+  const scanFilter = document.getElementById('scanSummaryFilter');
+  if (scanFilter) {
+    // Try to find and select this scan in dropdown
+    const optionExists = scanFilter.querySelector(`option[value="${scanId}"]`);
+    if (optionExists) {
+      scanFilter.value = scanId;
+    }
+  }
   
   // Test immediate fetch with error handling
   console.log("Testing immediate fetch");
   apiRequest(API_ROUTES.scanIntelligence(scanId), { method: "GET" })
     .then(data => {
       console.log("Immediate fetch successful:", data);
-      renderScanSummary(data);
+      if (data && (data.sections || data.message)) {
+        renderScanSummary(data);
+      } else {
+        // Data not ready yet, show loading state
+        console.log("Intelligence summary not ready yet, waiting for polling");
+      }
     })
     .catch(error => {
       console.error("Immediate fetch failed:", error);
@@ -1390,7 +1528,9 @@ function startScanSummaryPolling(scanId) {
         .then(response => response.json())
         .then(data => {
           console.log("Direct fetch successful:", data);
-          renderScanSummary(data);
+          if (data && (data.sections || data.message)) {
+            renderScanSummary(data);
+          }
         })
         .catch(err => console.error("Direct fetch also failed:", err));
     });
@@ -1402,15 +1542,67 @@ function startScanSummaryPolling(scanId) {
     try {
       const summary = await apiRequest(API_ROUTES.scanIntelligence(scanId), { method: "GET" });
       console.log("Received summary:", summary);
-      renderScanSummary(summary);
       
-      // Refresh both Severity Distribution and Security Trend during scan so details update in real time
-      await new Promise(resolve => setTimeout(resolve, 300));
-      await refreshDashboardCharts();
+      // Only render if we have valid data
+      if (summary && (summary.sections || summary.message)) {
+        renderScanSummary(summary);
+        
+        // Update floating progress widget based on executive summary content (tools completed / total)
+        let progressPercent = 0;
+        let progressStatus = summary.status || 'Running';
+        let toolsCompleted = 0;
+        let toolsTotal = 0;
+
+        if (Array.isArray(summary.sections)) {
+          const execSection = summary.sections.find((s) => s.type === 'executive_summary');
+          if (execSection && execSection.content) {
+            toolsCompleted = Number(execSection.content.tools_completed || 0);
+            toolsTotal = Number(execSection.content.tools_total || 0);
+            if (execSection.content.status) {
+              progressStatus = execSection.content.status;
+            }
+          }
+        }
+
+        if (toolsTotal > 0) {
+          progressPercent = Math.round((toolsCompleted / toolsTotal) * 100);
+        }
+
+        // Fallback if not available
+        if (toolsTotal === 0 && summary.findings_total && summary.findings_total > 0) {
+          const done = (summary.findings_found || 0);
+          progressPercent = Math.min(100, Math.round((done / summary.findings_total) * 100));
+        }
+
+        createOrUpdateProgressWidget(scanId, progressPercent, progressStatus);
+
+        // Update severity distribution chart while scan is running
+        if (typeof updateSeverityScope === 'function') {
+          updateSeverityScope('all').catch((e) => console.warn('Failed to update severity distribution during scan:', e));
+        }
+
+        // Update trend analytics less frequently during scan (every 30s)
+        try {
+          const now = Date.now();
+          if (now - lastTrendUpdateAt >= 30000) {
+            lastTrendUpdateAt = now;
+            if (typeof updateTrendFromApi === 'function') {
+              const rangeInput = document.getElementById('trendRange') || null;
+              const startDate = rangeInput && rangeInput.value ? rangeInput.value : new Date(Date.now() - 6 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+              const endDate = new Date().toISOString().split('T')[0];
+              updateTrendFromApi(startDate, endDate).catch((e) => console.warn('Failed to update trend analytics during scan:', e));
+            }
+          }
+        } catch (e) {
+          console.warn('Trend polling helper exception:', e);
+        }
+
+      }
       
       // Stop polling when scan is complete; refresh dashboard charts immediately
       if (summary.status === "completed" || summary.status === "completed_with_errors" || summary.status === "failed") {
         console.log("Scan completed, stopping polling");
+        removeProgressWidget();
         stopScanSummaryPolling();
         try {
           await new Promise(resolve => setTimeout(resolve, 800));
@@ -1518,18 +1710,40 @@ function renderScanSummary(summary) {
     container.dataset.scanId = String(summary.scan_id);
   }
 
-  // Use current time for "Summary generated" / "Findings analyzed" in Scanned Target Summary
-  const createdAt = new Date();
-  
-  // Store existing timestamps to preserve them during updates
-  const existingTimestamps = {};
-  const timestampElements = container.querySelectorAll('.summary-timestamp');
-  timestampElements.forEach(el => {
-    const sectionType = el.closest('.summary-section')?.dataset.sectionType;
-    if (sectionType) {
-      existingTimestamps[sectionType] = el.textContent;
+  // Use scan's completed_at time if available, otherwise fallback to created_at or current time
+  let createdAt = new Date();
+
+  // If intelligence summary returns created_at, use it first (stable saved scan time)
+  if (summary.created_at) {
+    createdAt = parseDateAsUTC(summary.created_at) || new Date();
+  } else if (summary.completed_at) {
+    createdAt = parseDateAsUTC(summary.completed_at) || new Date();
+  }
+
+  // Try to get the actual scan completion time from stored scan data
+  if (summary.scan_id) {
+    const cachedScans = window.cachedTargetScans || [];
+    const matchingScan = cachedScans.find(s => s.id === summary.scan_id);
+    if (matchingScan) {
+      if (matchingScan.created_at) {
+        createdAt = parseDateAsUTC(matchingScan.created_at) || createdAt;
+      } else if (matchingScan.completed_at) {
+        createdAt = parseDateAsUTC(matchingScan.completed_at) || createdAt;
+      }
     }
-  });
+  }
+
+  // Keep the same report timestamp after first render for a given scan.
+  // This prevents rapid polling from changing the visible "Report generated" value.
+  if (summary.scan_id && container.dataset.scanId && String(container.dataset.scanId) !== String(summary.scan_id)) {
+    delete container.dataset.reportTimestamp;
+  }
+
+  if (container.dataset.reportTimestamp) {
+    createdAt = parseDateAsUTC(container.dataset.reportTimestamp) || createdAt;
+  } else {
+    container.dataset.reportTimestamp = createdAt.toISOString();
+  }
   
   // Clear placeholder if present
   const placeholder = container.querySelector(".scan-summary-placeholder");
@@ -1563,16 +1777,39 @@ function renderScanSummary(summary) {
   // Remove any existing "All Findings" section (we no longer show it in Scanned Target Summary)
   container.querySelectorAll("[data-section-type=\"findings_table\"]").forEach(el => el.remove());
 
+  // Collect existing timestamps to preserve them during re-render
+  const existingTimestamps = {};
+  container.querySelectorAll('.summary-section').forEach(section => {
+    const sectionType = section.getAttribute('data-section-type');
+    const timestampEl = section.querySelector('.summary-timestamp');
+    if (sectionType && timestampEl) {
+      existingTimestamps[sectionType] = timestampEl.textContent;
+    }
+  });
+
   // Render each section - use unique id so multiple tool_result/vulnerability sections don't overwrite each other
   summary.sections.forEach((section, index) => {
     if (section.type === "findings_table") return; // Skip All Findings section
 
     const sectionId = `${section.type}__${(section.title || section.content?.title || index).toString().replace(/[^a-zA-Z0-9]/g, "_")}__${index}`;
     let sectionEl = container.querySelector(`[data-section-id="${sectionId}"]`);
+    // Preserve <details> open state (polling updates re-render sections)
+    const preservedDetailsOpenKeys = new Set();
+    const detailsKeyPrefix = sectionId;
+    // Preserve selected severity filter (so it doesn't auto-reset during polling updates)
+    let preservedSelectedSeverity = "";
     
     if (sectionEl) {
       // Update existing section but keep original timestamp
       sectionEl.classList.remove('summary-section-new');
+      sectionEl.querySelectorAll('details[data-details-key][open]').forEach((d) => {
+        const key = d.getAttribute('data-details-key');
+        if (key) preservedDetailsOpenKeys.add(key);
+      });
+      const prevExecContent = sectionEl.querySelector('.executive-summary-content');
+      if (prevExecContent && prevExecContent.dataset && prevExecContent.dataset.selectedSeverity) {
+        preservedSelectedSeverity = String(prevExecContent.dataset.selectedSeverity || "").trim();
+      }
     } else {
       // Create new section
       sectionEl = document.createElement("div");
@@ -1582,6 +1819,18 @@ function renderScanSummary(summary) {
       
       // Add fade-in animation with delay
       sectionEl.style.animationDelay = `${index * 0.2}s`;
+    }
+
+    // Preserve horizontal scroll positions for elements inside this section (e.g., Key Findings table)
+    const preservedScrollLeftByKey = new Map();
+    if (sectionEl) {
+      sectionEl.querySelectorAll('[data-scroll-key]').forEach((el) => {
+        const k = el.getAttribute('data-scroll-key');
+        if (!k) return;
+        try {
+          preservedScrollLeftByKey.set(k, el.scrollLeft || 0);
+        } catch (_) {}
+      });
     }
     
     let contentHtml = "";
@@ -1594,12 +1843,33 @@ function renderScanSummary(summary) {
         const dashboardSevColors = { critical: '#ef4444', high: '#f97316', medium: '#eab308', low: '#3b82f6', info: '#6b7280' };
         const riskLevelKey = (ex.risk_level || "na").toLowerCase().replace("/", "");
         const riskLevelColor = dashboardSevColors[riskLevelKey] || '#6b7280';
+
+        const sevCountsFromFindingsBySev = {
+          critical: Array.isArray(findingsBySev.critical) ? findingsBySev.critical.length : Number(findingsBySev.critical || 0),
+          high: Array.isArray(findingsBySev.high) ? findingsBySev.high.length : Number(findingsBySev.high || 0),
+          medium: Array.isArray(findingsBySev.medium) ? findingsBySev.medium.length : Number(findingsBySev.medium || 0),
+          low: Array.isArray(findingsBySev.low) ? findingsBySev.low.length : Number(findingsBySev.low || 0),
+          info: Array.isArray(findingsBySev.info) ? findingsBySev.info.length : Number(findingsBySev.info || 0),
+        };
+
+        const reportSeverityCounts = coerceSeverityCounts(
+          Object.keys(sevCountsFromFindingsBySev).some((k) => typeof sevCountsFromFindingsBySev[k] === 'number')
+            ? sevCountsFromFindingsBySev
+            : {
+                critical: Number(ex.critical || 0),
+                high: Number(ex.high || 0),
+                medium: Number(ex.medium || 0),
+                low: Number(ex.low || 0),
+                info: Number(ex.info || 0),
+              }
+        );
+
         const sevData = [
-          { key: "critical", count: ex.critical || 0, label: "Critical", color: dashboardSevColors.critical },
-          { key: "high", count: ex.high || 0, label: "High", color: dashboardSevColors.high },
-          { key: "medium", count: ex.medium || 0, label: "Medium", color: dashboardSevColors.medium },
-          { key: "low", count: ex.low || 0, label: "Low", color: dashboardSevColors.low },
-          { key: "info", count: ex.info || 0, label: "Info", color: dashboardSevColors.info },
+          { key: "critical", count: reportSeverityCounts.critical, label: "Critical", color: dashboardSevColors.critical },
+          { key: "high", count: reportSeverityCounts.high, label: "High", color: dashboardSevColors.high },
+          { key: "medium", count: reportSeverityCounts.medium, label: "Medium", color: dashboardSevColors.medium },
+          { key: "low", count: reportSeverityCounts.low, label: "Low", color: dashboardSevColors.low },
+          { key: "info", count: reportSeverityCounts.info, label: "Info", color: dashboardSevColors.info },
         ];
         contentHtml = `
           <div class="summary-section-header">
@@ -1608,42 +1878,90 @@ function renderScanSummary(summary) {
           </div>
           <div class="summary-section-content executive-summary-content" data-findings-by-severity="${encodeURIComponent(JSON.stringify(findingsBySev))}">
             <div class="executive-grid">
-              <div class="executive-item">
-                <span class="executive-label">Target</span>
-                <span class="executive-value">${ex.target || "-"}</span>
+              <div class="executive-item executive-item-target">
+                <span class="executive-label">Target:</span>
+                <span class="executive-value executive-value-target" title="${escapeHtml(ex.target || "")}">${escapeHtml(ex.target || "-")}</span>
               </div>
               <div class="executive-item">
-                <span class="executive-label">Status</span>
+                <span class="executive-label">Status:</span>
                 <span class="executive-value exec-status-${(ex.status || "").toLowerCase()}">${ex.status || "-"}</span>
               </div>
               <div class="executive-item">
-                <span class="executive-label">Total Findings</span>
+                <span class="executive-label">Total Findings:</span>
                 <span class="executive-value">${ex.total_findings || 0}</span>
               </div>
               <div class="executive-item">
-                <span class="executive-label">Risk Level</span>
+                <span class="executive-label">Risk Level:</span>
                 <span class="executive-value risk-badge risk-${riskLevelKey}" style="background-color:${riskLevelColor}; color:#fff">${ex.risk_level || "N/A"}</span>
               </div>
               <div class="executive-item">
-                <span class="executive-label">Tools</span>
+                <span class="executive-label">Tools:</span>
                 <span class="executive-value">${ex.tools_completed || 0}/${ex.tools_total || 0} completed</span>
               </div>
               ${((ex.status || '').toLowerCase() === 'completed' || (ex.status || '').toLowerCase() === 'completed_with_errors') ? `
               <div class="executive-item">
-                <span class="executive-label">Risk Score</span>
+                <span class="executive-label">Risk Score:</span>
                 <span class="executive-value">${ex.risk_score != null ? ex.risk_score + '/100' : 'N/A'}</span>
               </div>
               ` : ''}
               ${(ex.tools_failed_names || []).length > 0 ? `
               <div class="executive-item executive-item-full">
-                <span class="executive-label">Failed/Timeout</span>
+                <span class="executive-label">Failed/Timeout:</span>
                 <span class="executive-value failed-tools-list">${(ex.tools_failed_names || []).join(", ")}</span>
               </div>
               ` : ""}
               ${ex.clues_summary ? `
               <div class="executive-item executive-item-full">
-                <span class="executive-label">Clues</span>
-                <span class="executive-value clues-summary">${ex.clues_summary}</span>
+                <span class="executive-label">Clues:</span>
+                <span class="executive-value clues-summary">
+                  ${escapeHtml(ex.clues_summary)}
+                  ${ex.clues ? `
+                    <details class="exec-clues-details" data-details-key="exec-clues">
+                      <summary>View clues</summary>
+                      ${(() => {
+                        const c = ex.clues || {};
+                        const openPorts = Array.isArray(c.open_ports) ? c.open_ports : [];
+                        const ips = Array.isArray(c.ip_addresses) ? c.ip_addresses : [];
+                        const services = Array.isArray(c.http_services) ? c.http_services : [];
+                        const servers = Array.isArray(c.server_headers) ? c.server_headers : [];
+                        const titles = Array.isArray(c.page_titles) ? c.page_titles : [];
+                        const codes = Array.isArray(c.status_codes) ? c.status_codes : [];
+                        const tech = Array.isArray(c.technologies) ? c.technologies : [];
+                        const maxLen = Math.max(openPorts.length, ips.length, services.length, servers.length, titles.length, codes.length, tech.length, 1);
+                        const at = (arr, i) => (arr && arr[i] != null && String(arr[i]).trim() !== "") ? escapeHtml(String(arr[i])) : "—";
+                        const rows = Array.from({ length: maxLen }).map((_, i) => `
+                          <tr>
+                            <td>${at(openPorts, i)}</td>
+                            <td>${at(ips, i)}</td>
+                            <td>${at(services, i)}</td>
+                            <td>${at(codes, i)}</td>
+                            <td>${at(titles, i)}</td>
+                            <td>${at(servers, i)}</td>
+                            <td>${at(tech, i)}</td>
+                          </tr>
+                        `).join("");
+                        return `
+                          <div class="exec-clues-table-wrap">
+                            <table class="exec-clues-table">
+                              <thead>
+                                <tr>
+                                  <th>Open ports</th>
+                                  <th>IP found</th>
+                                  <th>HTTP services</th>
+                                  <th>Status codes</th>
+                                  <th>Page titles</th>
+                                  <th>Server</th>
+                                  <th>Technologies</th>
+                                </tr>
+                              </thead>
+                              <tbody>${rows}</tbody>
+                            </table>
+                          </div>
+                        `;
+                      })()}
+                    </details>
+                  ` : ""}
+                </span>
               </div>
               ` : ""}
             </div>
@@ -1653,26 +1971,41 @@ function renderScanSummary(summary) {
               `).join("")}
             </div>
             ${ex.severity_combined_note ? `<p class="executive-severity-note">Severity distribution: ${ex.severity_combined_note}</p>` : ""}
-            ${(ex.severity_by_tool && Object.keys(ex.severity_by_tool).length > 0) ? `
-            <div class="severity-by-tool-wrap">
-              <details class="severity-by-tool-details">
-                <summary>Severity by tool</summary>
-                <table class="severity-by-tool-table">
-                  <thead><tr><th>Tool</th><th>Critical</th><th>High</th><th>Medium</th><th>Low</th><th>Info</th></tr></thead>
-                  <tbody>
-                    ${Object.entries(ex.severity_by_tool).map(([tool, counts]) => `
-                      <tr><td>${tool}</td><td>${counts.critical || 0}</td><td>${counts.high || 0}</td><td>${counts.medium || 0}</td><td>${counts.low || 0}</td><td>${counts.info || 0}</td></tr>
-                    `).join("")}
-                  </tbody>
-                </table>
-              </details>
-            </div>
-            ` : ""}
             <div class="executive-findings-filtered" style="display: none;">
               <p class="executive-subtitle"><strong>Key Findings for <span class="filtered-severity-label"></span>:</strong></p>
               <div class="executive-findings-filtered-container"></div>
             </div>
             ${(() => {
+              // Preferred Key Findings table (professional fixed columns)
+              const v2Cols = ex.key_findings_v2_columns;
+              const v2Rows = ex.key_findings_v2_rows;
+              if (Array.isArray(v2Cols) && v2Cols.length > 0 && Array.isArray(v2Rows) && v2Rows.length > 0) {
+                const cols = v2Cols.filter(c => c != null && String(c).trim() !== '');
+                const escape = (v) => {
+                  if (v == null || v === '') return '—';
+                  const s = String(v).substring(0, 800);
+                  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+                };
+                const headerCells = cols.map(h => `<th>${escape(h)}</th>`).join('');
+                const bodyRows = v2Rows.map(row => {
+                  if (!row || typeof row !== 'object') return '';
+                  return `<tr>${cols.map(c => `<td class="key-find-col">${escape(row[c])}</td>`).join('')}</tr>`;
+                }).filter(Boolean).join('');
+                if (bodyRows) {
+                  return `
+            <div class="executive-findings-default">
+              <p class="executive-subtitle"><strong>Key Findings:</strong></p>
+              ${ex.key_findings_note ? `<p class="executive-findings-note">${escapeHtml(ex.key_findings_note)}</p>` : ""}
+              <div class="key-findings-table-wrap" data-scroll-key="key-findings">
+                <table class="key-findings-table">
+                  <thead><tr>${headerCells}</tr></thead>
+                  <tbody>${bodyRows}</tbody>
+                </table>
+              </div>
+            </div>
+            `;
+                }
+              }
               const kft = ex.key_findings_table;
               if (kft && Array.isArray(kft.columns) && kft.columns.length > 0 && Array.isArray(kft.rows) && kft.rows.length > 0) {
                 const cols = kft.columns.filter(c => c != null && String(c).trim() !== '');
@@ -1691,7 +2024,8 @@ function renderScanSummary(summary) {
                     return `
             <div class="executive-findings-default">
               <p class="executive-subtitle"><strong>Key Findings:</strong></p>
-              <div class="key-findings-table-wrap">
+              ${ex.key_findings_note ? `<p class="executive-findings-note">${escapeHtml(ex.key_findings_note)}</p>` : ""}
+              <div class="key-findings-table-wrap" data-scroll-key="key-findings">
                 <table class="key-findings-table">
                   <thead><tr>${headerCells}</tr></thead>
                   <tbody>${bodyRows}</tbody>
@@ -1736,7 +2070,8 @@ function renderScanSummary(summary) {
               return `
             <div class="executive-findings-default">
               <p class="executive-subtitle"><strong>Key Findings:</strong></p>
-              <div class="key-findings-table-wrap">
+              ${ex.key_findings_note ? `<p class="executive-findings-note">${escapeHtml(ex.key_findings_note)}</p>` : ""}
+              <div class="key-findings-table-wrap" data-scroll-key="key-findings">
                 <table class="key-findings-table">
                   <thead>
                     <tr>
@@ -1766,7 +2101,16 @@ function renderScanSummary(summary) {
                           ipFound = extractIpFound(f.description || '');
                         }
                       }
-                      const template = !isServiceRow(f) && t !== 'naabu' && (f.description || '').trim() && !looksLikeIpOrSubdomain(f.description || '') ? desc : '—';
+                      // Avoid duplicating URL in Template when description is "Historical URL: <url>" and location is that url
+                      let template = '—';
+                      if (!isServiceRow(f) && t !== 'naabu' && (f.description || '').trim() && !looksLikeIpOrSubdomain(f.description || '')) {
+                        const d = (f.description || '').trim();
+                        if (/^Historical URL:\s*/i.test(d) && loc && d.replace(/^Historical URL:\s*/i, '').trim() === loc) {
+                          template = 'Historical URL';
+                        } else {
+                          template = desc;
+                        }
+                      }
                       const cells = [
                         `<td><span class="sev-mini severity-${f.severity}">${f.severity}</span> ${f.tool}</td>`,
                         `<td class="key-find-col">${openPorts}</td>`,
@@ -1783,7 +2127,7 @@ function renderScanSummary(summary) {
             `;
             })()}
           </div>
-          <div class="summary-timestamp">Summary generated: ${formatDate(createdAt)}</div>
+          <div class="summary-timestamp">Report generated: ${formatDate(createdAt)}</div>
         `;
         break;
         
@@ -1842,7 +2186,7 @@ function renderScanSummary(summary) {
             <p>Attack Type: <span class="summary-highlight">${section.content.attack_type}</span></p>
             <p>User Selected Tools: <span class="summary-highlight">${section.content.user_selected_tools.join(", ")}</span></p>
           </div>
-          <div class="summary-timestamp">Configuration set: ${formatDate(createdAt)}</div>
+          <div class="summary-timestamp">Report generated: ${formatDate(createdAt)}</div>
         `;
         break;
         
@@ -1862,14 +2206,14 @@ function renderScanSummary(summary) {
             </ul>
             ${ar.can_support_attack ? "<p class=\"attack-relevance-warn\">⚠️ Findings from the tools above could support this attack type. Remediate vulnerabilities to reduce risk.</p>" : "<p class=\"attack-relevance-info\">No direct vulnerabilities for this attack type were identified. Findings are useful for reconnaissance only.</p>"}
           </div>
-          <div class="summary-timestamp">${formatDate(createdAt)}</div>
+          <div class="summary-timestamp">Report generated: ${formatDate(createdAt)}</div>
         `;
         break;
         
       case "clues":
         const stats = section.content.statistics || {};
         const riskAssessment = section.content.risk_assessment || {};
-        const detailedFindings = section.content.detailed_findings || [];
+        // Detailed Findings table removed from UI per requirement
         const findingsByTool = stats.findings_by_tool || [];
         
         contentHtml = `
@@ -1921,28 +2265,10 @@ function renderScanSummary(summary) {
             ${findingsByTool.length > 0 ? `
             <div class="recon-tools-section">
               <h5 class="recon-subtitle">Findings by Tool</h5>
-              <table class="recon-tools-table recon-tools-by-row">
-                <thead><tr>${findingsByTool.map(t => `<th>${t.tool}</th>`).join('')}</tr></thead>
-                <tbody><tr>${findingsByTool.map(t => `<td>${t.count}</td>`).join('')}</tr></tbody>
-              </table>
-            </div>
-            ` : ''}
-            
-            ${detailedFindings.length > 0 ? `
-            <div class="recon-details-section">
-              <h5 class="recon-subtitle">Detailed Findings</h5>
-              <div class="detailed-findings-container">
-                <table class="recon-findings-table">
-                  <thead><tr><th>Tool</th><th>Severity</th><th>Location</th><th>Description</th></tr></thead>
-                  <tbody>
-                    ${detailedFindings.map(f => `
-                      <tr>
-                        <td><span class="finding-tool">${f.tool}</span></td>
-                        <td><span class="finding-severity severity-${f.severity}">${f.severity.toUpperCase()}</span></td>
-                        <td><code class="finding-location">${(f.location || '').substring(0, 80)}${(f.location || '').length > 80 ? '…' : ''}</code></td>
-                        <td>${(f.description || '').substring(0, 120)}${(f.description || '').length > 120 ? '…' : ''}</td>
-                      </tr>`).join('')}
-                  </tbody>
+              <div class="summary-table-wrap">
+                <table class="summary-table recon-tools-table recon-tools-by-row">
+                  <thead><tr>${findingsByTool.map(t => `<th>${t.tool}</th>`).join('')}</tr></thead>
+                  <tbody><tr>${findingsByTool.map(t => `<td>${t.count}</td>`).join('')}</tr></tbody>
                 </table>
               </div>
             </div>
@@ -1958,7 +2284,7 @@ function renderScanSummary(summary) {
             
             <p class="recon-insight">${section.content.intelligence_insight}</p>
           </div>
-          <div class="summary-timestamp">Findings analyzed: ${formatDate(createdAt)}</div>
+          <div class="summary-timestamp">Report generated: ${formatDate(createdAt)}</div>
         `;
         break;
         
@@ -1986,7 +2312,7 @@ function renderScanSummary(summary) {
             ${skippedList ? `<p><strong>Tools Skipped (with reason):</strong></p><ul class="summary-findings-list">${skippedList}</ul>` : ""}
             <p><strong>Reason:</strong> ${dec.reason || "Based on initial reconnaissance clues."}</p>
           </div>
-          <div class="summary-timestamp">AI decision made: ${formatDate(createdAt)}</div>
+          <div class="summary-timestamp">Report generated: ${formatDate(createdAt)}</div>
         `;
         break;
         
@@ -2019,10 +2345,76 @@ function renderScanSummary(summary) {
             </div>
           `;
         }
+        // Output rendering:
+        // - Show first 10 lines by default
+        // - "View more" expands to show ALL remaining lines
+        // - Prefer raw_output (full tool output file) when available, so long outputs are not capped
         if (readableOutput && Array.isArray(readableOutput) && readableOutput.length > 0) {
+          let outputLines = readableOutput;
+          if (section.content.raw_output) {
+            const rawLines = String(section.content.raw_output).split(/\r?\n/);
+            // Keep the "Findings: N" header from readable_output if raw output file doesn't include it
+            let header = (readableOutput[0] || "").trim();
+            if (header && /^Findings:\s*\d+/i.test(header) && !(rawLines[0] || "").includes("Findings:")) {
+              // If raw output contains more URLs than parsed findings, reflect the real count in the header.
+              const toolHint = ((section.title || "") + " " + (section.content.command || "")).toLowerCase();
+              if (toolHint.includes("cewl")) {
+                header = "Findings: Wordlist";
+                outputLines = [header, ...rawLines];
+              } else {
+              const trimmedLines = rawLines.map(l => (l || "").trim());
+              const httpLines = trimmedLines.filter(l => l.toLowerCase().startsWith("http"));
+              // GAU/Katana/GoSpider often include duplicate URLs; count unique URLs so totals align with deduped findings.
+              // GoSpider may embed URLs inside other log lines; extract via regex for accurate unique counts.
+              let urlCount = httpLines.length;
+              if (toolHint.includes("gau") || toolHint.includes("katana")) {
+                urlCount = new Set(httpLines).size;
+              } else if (toolHint.includes("gospider")) {
+                const urlSet = new Set();
+                const re = /https?:\/\/[^\s]+/g;
+                for (const line of trimmedLines) {
+                  const matches = line.match(re);
+                  if (matches && matches.length) {
+                    matches.forEach(u => urlSet.add(u));
+                  }
+                }
+                urlCount = urlSet.size;
+              }
+              if (urlCount > 0) header = `Findings: ${urlCount}`;
+              outputLines = [header, ...rawLines];
+              }
+            } else {
+              outputLines = rawLines;
+            }
+            // Drop any empty trailing lines
+            while (outputLines.length > 0 && String(outputLines[outputLines.length - 1]).trim() === "") {
+              outputLines.pop();
+            }
+            // GoSpider output often includes many empty lines between URL groups.
+            // Rendering empty lines creates visible "gaps" (blank space) in the UI.
+            // Filter only for GoSpider so other tools' formatting remains unchanged.
+            const toolHint = ((section.title || "") + " " + (section.content.command || "")).toLowerCase();
+            if (toolHint.includes("gospider")) {
+              outputLines = outputLines.filter((ln) => (ln || "").toString().trim() !== "");
+            }
+          }
+
+          const previewLines = outputLines.slice(0, 10);
+          const remainingLines = outputLines.slice(10);
+          const hasMore = remainingLines.length > 0;
+          const detailsKey = `tool-output-${detailsKeyPrefix}`;
           contentHtml += `
             <div class="tool-output-lines">
-              ${readableOutput.map(line => `<div class="tool-output-line">${escapeHtml(line)}</div>`).join("")}
+              ${previewLines.map(line => `<div class="tool-output-line">${escapeHtml(line)}</div>`).join("")}
+              ${hasMore ? `
+                <details class="tool-output-details" data-details-key="${detailsKey}">
+                  <summary>View more</summary>
+                  <div class="tool-output-more">
+                    ${remainingLines.map(line => `<div class="tool-output-line">${escapeHtml(line)}</div>`).join("")}
+                    <button type="button" class="tool-output-less">View less</button>
+                  </div>
+                </details>
+              ` : ""}
             </div>
           `;
         } else if (section.type === "dns_validation") {
@@ -2072,7 +2464,7 @@ function renderScanSummary(summary) {
         }
         contentHtml += `
           </div>
-          <div class="summary-timestamp">Tool executed: ${formatDate(createdAt)}</div>
+          <div class="summary-timestamp">Report generated: ${formatDate(createdAt)}</div>
         `;
         break;
         
@@ -2167,6 +2559,38 @@ function renderScanSummary(summary) {
     
     sectionEl.innerHTML = contentHtml;
     
+    // Restore preserved <details> open state after re-render (prevents auto-collapse during polling)
+    if (preservedDetailsOpenKeys.size > 0) {
+      preservedDetailsOpenKeys.forEach((key) => {
+        const d = sectionEl.querySelector(`details[data-details-key="${key}"]`);
+        if (d) d.open = true;
+      });
+    }
+
+    // Restore preserved horizontal scroll positions after re-render
+    if (preservedScrollLeftByKey.size > 0) {
+      preservedScrollLeftByKey.forEach((left, key) => {
+        const el = sectionEl.querySelector(`[data-scroll-key="${key}"]`);
+        if (!el) return;
+        try {
+          el.scrollLeft = left;
+        } catch (_) {}
+      });
+    }
+
+    // Restore selected severity filter (re-apply after polling re-render)
+    if (preservedSelectedSeverity) {
+      const execContent = sectionEl.querySelector('.executive-summary-content');
+      if (execContent) {
+        execContent.dataset.selectedSeverity = preservedSelectedSeverity;
+        const btn = execContent.querySelector(`.sev-badge[data-severity="${preservedSelectedSeverity}"]`);
+        // Trigger the existing click handler to rebuild the filtered view.
+        if (btn && !btn.classList.contains('active')) {
+          try { btn.click(); } catch (_) {}
+        }
+      }
+    }
+    
     // Preserve existing timestamp if this is an update
     if (existingTimestamps[section.type]) {
       const timestampEl = sectionEl.querySelector('.summary-timestamp');
@@ -2189,6 +2613,17 @@ function renderScanSummary(summary) {
       // For existing sections, don't change scroll position
       // This prevents jumping when updating content
     }
+  });
+
+  // Handle "View less" for tool outputs (collapse without affecting other sections)
+  container.querySelectorAll(".tool-output-less").forEach((btn) => {
+    if (btn.dataset.bound === "1") return;
+    btn.dataset.bound = "1";
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      const details = btn.closest("details");
+      if (details) details.open = false;
+    });
   });
 
   // Append live output section when selected scan is running
@@ -2234,6 +2669,7 @@ document.addEventListener('DOMContentLoaded', function() {
       const wasActive = btn.classList.contains('active');
       content.querySelectorAll('.sev-badge[data-severity]').forEach(b => b.classList.remove('active'));
       if (wasActive) {
+        content.dataset.selectedSeverity = "";
         filteredDiv.style.display = 'none';
         if (defaultDiv) defaultDiv.style.display = '';
         return;
@@ -2248,6 +2684,7 @@ document.addEventListener('DOMContentLoaded', function() {
       } catch (_) { return; }
       const findings = findingsBySev[severity] || [];
       btn.classList.add('active');
+      content.dataset.selectedSeverity = severity;
       if (count === 0 || findings.length === 0) {
         labelEl.textContent = severity.charAt(0).toUpperCase() + severity.slice(1);
         listEl.innerHTML = '<p class="no-findings-msg">No findings for this severity.</p>';
@@ -2358,20 +2795,30 @@ document.addEventListener('DOMContentLoaded', function() {
           const response = await apiRequest(API_ROUTES.markScanSaved(scanIdToSave), { method: "POST" });
           if (response) {
             showStyledPopup('Scan summary saved successfully!');
-                      
-            // Refresh the saved reports view and dashboard
+            
+            // Refresh Saved Reports immediately so it appears in the table
+            try {
+              if (typeof refreshSavedReports === "function") {
+                await refreshSavedReports();
+              }
+            } catch (e) {
+              console.warn("Failed to refresh Saved Reports after save", e);
+            }
+            
+            // Also refresh general scan views/dropdowns (non-blocking)
             setTimeout(() => {
-              // Refresh all scan views including saved reports
-              if (typeof refreshScansViews === 'function') {
-                refreshScansViews();
+              try {
+                if (typeof refreshScansViews === 'function') {
+                  refreshScansViews();
+                }
+                const scanFilter = document.getElementById('scanSummaryFilter');
+                if (scanFilter && typeof populateScanFilterOptions === 'function') {
+                  populateScanFilterOptions(scanFilter);
+                }
+              } catch (e) {
+                console.warn("Post-save refresh failed", e);
               }
-                        
-              // Also update the scan filter options
-              const scanFilter = document.getElementById('scanSummaryFilter');
-              if (scanFilter && typeof populateScanFilterOptions === 'function') {
-                populateScanFilterOptions(scanFilter);
-              }
-            }, 500); // Small delay to ensure save is processed
+            }, 300); // Small delay to ensure save is processed
                       
             // Update the severity distribution chart with the new data
             setTimeout(() => {
@@ -2443,12 +2890,51 @@ document.addEventListener('DOMContentLoaded', function() {
       if (selectedValue) {
         const scanId = parseInt(selectedValue, 10);
         console.log('Loading summary for scan:', scanId);
-        
+          
+        // Stop any existing polling for previous scan
         stopScanSummaryPolling();
         currentScanId = scanId;
-        
-        // Poll until full summary is visible (handles delayed/partial responses)
-        startScanSummaryPolling(scanId);
+          
+        // Clear container and show loading state immediately
+        const container = document.getElementById("scanSummaryContainer");
+        if (container) {
+          container.innerHTML = `
+            <div class="scan-summary-placeholder">
+              <div class="summary-placeholder-icon">⏳</div>
+              <div class="summary-placeholder-text">Loading scan #${scanId}…</div>
+              <div class="summary-placeholder-subtext">Fetching intelligence summary...</div>
+            </div>`;
+          container.dataset.scanId = String(scanId);
+          delete container.dataset.reportTimestamp;
+        }
+          
+        // Immediately fetch the summary
+        apiRequest(API_ROUTES.scanIntelligence(scanId), { method: "GET" })
+          .then(data => {
+            console.log("Dropdown selection fetch successful:", data);
+            if (data && (data.sections || data.message)) {
+              renderScanSummary(data);
+            } else {
+              // No data available yet
+              container.innerHTML = `
+                <div class="scan-summary-placeholder">
+                  <div class="summary-placeholder-icon">ℹ️</div>
+                  <div class="summary-placeholder-text">No intelligence summary available for scan #${scanId}</div>
+                  <div class="summary-placeholder-subtext">The scan may still be running or has no AI analysis yet.</div>
+                </div>`;
+            }
+          })
+          .catch(error => {
+            console.error("Dropdown selection fetch failed:", error);
+            if (container) {
+              container.innerHTML = `
+                <div class="scan-summary-placeholder">
+                  <div class="summary-placeholder-icon">⚠️</div>
+                  <div class="summary-placeholder-text">Could not load scan #${scanId}</div>
+                  <div class="summary-placeholder-subtext">Error: ${error.message || 'Unknown error'}</div>
+                </div>`;
+            }
+          });
       }
     });
   }
@@ -2636,7 +3122,8 @@ async function populateScanFilterOptions(filterElement) {
   populateScanFilterOptionsInProgress = true;
   const previousValue = filterElement.value;
   try {
-    const response = await fetchScans({}, false); // includeUnsaved=false: only saved scans (saved reports)
+    // Fetch ONLY saved scans (saved reports) for the dropdown
+    const response = await fetchScans({}, false); // includeUnsaved=false: only saved scans
     if (response && response.scans) {
       // Remove all options first so we never show duplicates
       while (filterElement.options.length) {
@@ -2647,11 +3134,14 @@ async function populateScanFilterOptions(filterElement) {
       placeholder.textContent = 'Select a scan';
       filterElement.appendChild(placeholder);
 
-      const sortedScans = response.scans.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+      const sortedScans = response.scans.sort(
+        (a, b) => parseDateAsUTC(b.created_at) - parseDateAsUTC(a.created_at)
+      );
       sortedScans.forEach(scan => {
         const option = document.createElement('option');
         option.value = scan.id;
-        option.textContent = `#${scan.id} - ${scan.target} (${scan.owasp_category_name || scan.owasp_category}) - ${scan.status}`;
+        const statusLabel = (scan.status || 'unknown').toLowerCase() === 'running' ? '🔄 Running' : scan.status;
+        option.textContent = `#${scan.id} - ${scan.target} (${scan.owasp_category_name || scan.owasp_category}) - ${statusLabel}`;
         filterElement.appendChild(option);
       });
       if (previousValue && filterElement.querySelector(`option[value="${previousValue}"]`)) {
@@ -2680,15 +3170,23 @@ refreshScansViews = async function() {
   updateScanFilter(); // Update the scan filter options
 };
 
-// Modify startScanSummaryPolling to set filter when scan is in dropdown (saved scans only)
+// Modify startScanSummaryPolling to set filter when scan is in dropdown (saved OR running scans)
 const originalStartScanSummaryPolling = startScanSummaryPolling;
 startScanSummaryPolling = function(scanId) {
   originalStartScanSummaryPolling(scanId);
   
   const scanFilter = document.getElementById('scanSummaryFilter');
-  if (scanFilter && scanFilter.querySelector(`option[value="${scanId}"]`)) {
-    // Only set selection if scan is in dropdown (i.e. saved)
-    scanFilter.value = scanId;
+  if (scanFilter) {
+    // Always try to set the selection for the current scan
+    // This works for both saved scans (in dropdown) and running scans (may not be in dropdown yet)
+    const optionExists = scanFilter.querySelector(`option[value="${scanId}"]`);
+    if (optionExists) {
+      scanFilter.value = scanId;
+    } else {
+      // Scan not in dropdown yet (running scan, not saved), but still show it
+      // The dropdown only shows saved scans, but we can still display running scans
+      console.log(`Scan ${scanId} not in dropdown (not saved yet), but displaying anyway`);
+    }
   }
 };
 
@@ -2714,9 +3212,9 @@ function summarizeStats(scans) {
   scans.forEach((scan) => {
     if (scan.target) targets.add(scan.target);
     const findings = scan.findings || [];
-    if (Array.isArray(findings)) {
-      let worst = 0;
+    let worst = 0;
 
+    if (Array.isArray(findings) && findings.length > 0) {
       findings.forEach((f) => {
         const sev = (f.severity || "").toLowerCase();
         if (sev === "critical") {
@@ -2733,16 +3231,29 @@ function summarizeStats(scans) {
           worst = Math.max(worst, 1);
         }
       });
-
-      const scanStatus = (scan.status || "").toLowerCase();
-      const isCompleted = scanStatus === "completed" || scanStatus === "completed_with_errors";
-
-      if (worst >= 3) {
-        criticalTargets.add(scan.target);
-      } else if (isCompleted && worst === 0) {
-        // "Clean" means no risk findings (no critical/high/medium/low). Info-only is still clean.
-        cleanAssets.add(scan.target);
+    } else {
+      // GET /api/scans does not embed findings; use finding_count + highest_severity per scan
+      const fc = scan.finding_count;
+      if (fc === 0) {
+        worst = 0;
+      } else if (scan.highest_severity) {
+        const hs = String(scan.highest_severity).toLowerCase();
+        if (hs === "critical") worst = 4;
+        else if (hs === "high") worst = 3;
+        else if (hs === "medium") worst = 2;
+        else if (hs === "low") worst = 1;
+        else worst = 0;
       }
+    }
+
+    const scanStatus = (scan.status || "").toLowerCase();
+    const isCompleted = scanStatus === "completed" || scanStatus === "completed_with_errors";
+
+    if (worst >= 3) {
+      criticalTargets.add(scan.target);
+    } else if (isCompleted && worst < 2) {
+      // Clean: no medium+ (no findings, or only info/low). Info-only often reports as highest low from API.
+      cleanAssets.add(scan.target);
     }
   });
 
@@ -2910,27 +3421,45 @@ function initCharts() {
           backgroundColor: 'rgba(2, 6, 23, 0.95)',
           borderColor: '#38bdf8',
           borderWidth: 2,
-          padding: 12,
+          padding: 14,
           titleColor: '#f9fafb',
           bodyColor: '#e5e7eb',
+          bodyFont: {
+            size: 13,
+            weight: '500',
+          },
+          titleFont: {
+            size: 14,
+            weight: '600',
+          },
           boxPadding: 10,
           displayColors: true,
           caretPadding: 15,
+          cornerRadius: 8,
+          animation: false,
+          mode: 'index',
+          intersect: false,
+          axis: 'x',
+          position: 'average',
           callbacks: {
             title: function (ctx) {
-              return ctx[0].label;
+              const date = ctx[0].label;
+              return `📅 ${date}`;
             },
             label: function (ctx) {
               const dataset = ctx.dataset.label;
               const value = ctx.parsed.y;
               if (dataset === 'Findings') {
-                return `📊 ${dataset}: ${value}`;
+                return `🔵 Findings: ${value}`;
               } else {
-                return `⚠️ ${dataset}: ${value}`;
+                return `🔴 Vulnerabilities: ${value}`;
               }
             },
             afterBody: function (ctx) {
-              return ['', '(Click to see all findings for this day)'];
+              return [
+                '',
+                `💡 Click to view Details`,
+              ];
             },
           },
         },
@@ -2970,16 +3499,24 @@ function initCharts() {
       {
       id: 'autoScaleY',
       afterDatasetsDraw(chart) {
-        const yScale = chart.scales.y;
-        const maxData = Math.max(
-          ...chart.data.datasets[0].data,
-          ...chart.data.datasets[1].data
-        );
+        const yScale = chart.scales && chart.scales.y;
+        if (!yScale) return;
+        const ds0 = chart.data?.datasets?.[0]?.data || [];
+        const ds1 = chart.data?.datasets?.[1]?.data || [];
+        const maxData = Math.max(...ds0, ...ds1, 1);
         const newMax = Math.ceil(Math.max(maxData, 1) / 5) * 5 + 5;
-        if (yScale.max !== newMax) {
-          yScale.max = newMax;
-          chart.update('none');
-        }
+        if (yScale.max === newMax) return;
+
+        // Prevent infinite recursive updates:
+        // afterDatasetsDraw -> chart.update -> afterDatasetsDraw -> chart.update ...
+        // Schedule the update once per frame instead of calling update immediately.
+        if (chart.$autoScaleYScheduled) return;
+        chart.$autoScaleYScheduled = true;
+        yScale.max = newMax;
+        requestAnimationFrame(() => {
+          chart.$autoScaleYScheduled = false;
+          try { chart.update('none'); } catch (_) {}
+        });
       }
     },
     {
@@ -3091,11 +3628,11 @@ function initCharts() {
             data: [0, 0, 0, 0, 0],
             backgroundColor: ["#ef4444", "#f97316", "#eab308", "#3b82f6", "#6b7280"],
             borderColor: "#020617",
-            borderWidth: 0,
-            borderRadius: 0,
+            borderWidth: 1,
+            borderRadius: 4,
             hoverBorderColor: "#ffffff",
             hoverBorderWidth: 2,
-            spacing: 2,
+            spacing: 4,
           },
         ],
       },
@@ -3237,9 +3774,9 @@ function buildScanSeries(scans, rangeKey, labels) {
   const countByDate = {};
   scans.forEach((scan) => {
     if (!scan.created_at) return;
-    const d = new Date(scan.created_at);
-    if (d < start || d >= end) return;
-    const key = d.toISOString().split("T")[0];
+    const d = parseDateAsUTC(scan.created_at);
+    if (!d || isNaN(d.getTime()) || d < start || d >= end) return;
+    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
     countByDate[key] = (countByDate[key] || 0) + 1;
   });
 
@@ -3285,6 +3822,14 @@ async function updateTrendFromApi(startDateOrRange, endDate) {
 const SEVERITY_LABELS = ["Critical", "High", "Medium", "Low", "Info"];
 const SEVERITY_COLORS = ["#ef4444", "#f97316", "#eab308", "#3b82f6", "#6b7280"];
 
+// Prevent re-entrant severity chart updates during initial load/polling.
+// This avoids Chart.js crashes like "Maximum call stack size exceeded" when
+// multiple callers trigger updates simultaneously.
+let severityScopeInFlight = false;
+let severityScopeQueued = false;
+// Track when we last refreshed trend analytics during active polling, to avoid too-frequent network calls.
+let lastTrendUpdateAt = 0;
+
 function updateSeverityChart(sevCounts) {
   if (!severityChart) return;
   console.log("=== UPDATE SEVERITY CHART ===");
@@ -3318,8 +3863,8 @@ function updateSeverityChart(sevCounts) {
   severityChart.data.labels = chartLabels;
   severityChart.data.datasets[0].data = chartData;
   severityChart.data.datasets[0].backgroundColor = chartColors;
-  // No gap when only one severity (ring connects); gap between segments when multiple severities
-  severityChart.data.datasets[0].spacing = isSingleSeverity ? 0 : 2;
+  // No gap when only one severity (ring connects); small gap between slices when multiple severities
+  severityChart.data.datasets[0].spacing = isSingleSeverity ? 0 : 4;
   console.log("Dataset data set to:", chartData);
 
   // Update legend counts - each severity its own row
@@ -3336,21 +3881,37 @@ function updateSeverityChart(sevCounts) {
 }
 
 async function updateSeverityScope(scopeValue) {
+  if (severityScopeInFlight) {
+    severityScopeQueued = true;
+    return;
+  }
+  severityScopeInFlight = true;
   console.log("=== UPDATE SEVERITY SCOPE CALLED ===");
   console.log("Scope value:", scopeValue);
-  // Always show cumulative severity distribution of ALL scans
-  // Ignore any specific scan selection - always use global view
-  const sev = await fetchSeverityStats();
-  console.log("Global severity stats received:", sev);
-  console.log("Processing data for chart update...");
-  updateSeverityChart({
-    critical: sev.critical || 0,
-    high: sev.high || 0,
-    medium: sev.medium || 0,
-    low: sev.low || 0,
-    info: sev.info || 0,
-  });
-  console.log("=== UPDATE SEVERITY SCOPE COMPLETE ===");
+  try {
+    // Always show cumulative severity distribution of ALL scans
+    // Ignore any specific scan selection - always use global view
+    const sev = await fetchSeverityStats();
+    console.log("Global severity stats received:", sev);
+    console.log("Processing data for chart update...");
+    updateSeverityChart({
+      critical: sev.critical || 0,
+      high: sev.high || 0,
+      medium: sev.medium || 0,
+      low: sev.low || 0,
+      info: sev.info || 0,
+    });
+    console.log("=== UPDATE SEVERITY SCOPE COMPLETE ===");
+  } finally {
+    severityScopeInFlight = false;
+    if (severityScopeQueued) {
+      severityScopeQueued = false;
+      // Avoid synchronous recursion (prevents call-stack issues). Run after paint.
+      setTimeout(() => {
+        updateSeverityScope(scopeValue).catch(() => {});
+      }, 0);
+    }
+  }
 }
 
 /**
@@ -3411,7 +3972,7 @@ async function showTrendDetailModal(dayLabel, dayIndex) {
   const modal = document.createElement('div');
   modal.className = 'modal-backdrop';
   modal.innerHTML = `
-    <div class="modal" style="max-height: 85vh; overflow-y: auto; max-width: 900px; width: 90%;">
+    <div class="modal trend-day-detail-modal" style="max-height: 85vh; overflow-y: auto; max-width: min(96vw, 1200px); width: 92%;">
       <div class="modal-header">
         <div>
           <div class="modal-title">📊 ${dayLabel} - Findings Report</div>
@@ -3449,7 +4010,8 @@ async function showTrendDetailModal(dayLabel, dayIndex) {
             <div style="font-size: 12px;">All scanned targets were secure</div>
           </div>
         ` : `
-          <table class="data-table" style="width: 100%; font-size: 12px;">
+          <div class="trend-day-detail-table-wrap">
+          <table class="data-table trend-day-detail-table" style="width: 100%; font-size: 12px;">
             <thead>
               <tr>
                 <th>Tool</th>
@@ -3460,17 +4022,21 @@ async function showTrendDetailModal(dayLabel, dayIndex) {
               </tr>
             </thead>
             <tbody>
-              ${dayFindings.map(f => `
+              ${dayFindings.map(f => {
+                const typ = f.type ? String(f.type).charAt(0).toUpperCase() + String(f.type).slice(1) : '-';
+                return `
                 <tr>
-                  <td style="font-weight: 500;">${f.tool_name || '-'}</td>
-                  <td>${f.type ? f.type.charAt(0).toUpperCase() + f.type.slice(1) : '-'}</td>
-                  <td><span class="tag tag-${(f.severity || 'low').toLowerCase()}">${(f.severity || 'unknown').toUpperCase()}</span></td>
-                  <td style="max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${f.location || '-'}">${f.location || '-'}</td>
-                  <td style="max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${f.description || '-'}">${f.description ? f.description.substring(0, 50) + '...' : '-'}</td>
+                  <td style="font-weight: 500;">${escapeHtml(String(f.tool_name || '-'))}</td>
+                  <td>${escapeHtml(typ)}</td>
+                  <td><span class="tag tag-${(f.severity || 'low').toLowerCase()}">${escapeHtml(String((f.severity || 'unknown').toUpperCase()))}</span></td>
+                  <td class="trend-day-detail-cell-location">${escapeHtml(String(f.location != null ? f.location : '-'))}</td>
+                  <td class="trend-day-detail-cell-desc">${escapeHtml(String(f.description != null ? f.description : '-'))}</td>
                 </tr>
-              `).join('')}
+              `;
+              }).join('')}
             </tbody>
           </table>
+          </div>
         `}
       </div>
     </div>
@@ -3735,7 +4301,7 @@ function renderTargetsTable(scans) {
         async () => {
           try {
             // Get all scan IDs for this target
-            const response = await fetch(getApiUrl("/api/scans"));
+            const response = await fetch(getApiUrl("/api/scans?page=1&page_size=100"));
             const data = await response.json();
             // Handle both array and object with 'scans' property
             const scans = Array.isArray(data) ? data : data.scans || [];
@@ -3782,25 +4348,35 @@ function renderTargetsTable(scans) {
   });
 }
 
-// Date formatting utility function
-function formatDate(date) {
-  if (!(date instanceof Date)) {
-    date = new Date(date);
+// Date formatting utility function — API datetimes are naive UTC; parse as UTC so local display matches wall clock.
+function formatDate(value) {
+  const date = parseDateAsUTC(value);
+  if (!date || isNaN(date.getTime())) {
+    if (value == null || value === "") return "—";
+    return "Invalid Date";
   }
-  
-  // Check if the date is valid
-  if (isNaN(date.getTime())) {
-    return 'Invalid Date';
-  }
-  
-  // Format as YYYY-MM-DD HH:MM in Nepal timezone
-  return date.toLocaleDateString('en-US', { timeZone: 'Asia/Kathmandu' }) + ' ' + 
-         date.toLocaleTimeString('en-US', { timeZone: 'Asia/Kathmandu', hour: '2-digit', minute: '2-digit' });
+  // Local calendar/time (browser timezone) after correct UTC instant
+  const month = date.getMonth() + 1;
+  const day = date.getDate();
+  const year = date.getFullYear();
+  let hours = date.getHours();
+  const minutes = date.getMinutes().toString().padStart(2, "0");
+  const ampm = hours >= 12 ? "PM" : "AM";
+  hours = hours % 12;
+  hours = hours ? hours : 12;
+  return `${month}/${day}/${year} ${hours}:${minutes} ${ampm}`;
 }
 
-// Parse API datetime string as UTC when no timezone given (so we can show in user's local time)
+// Format current time in Kathmandu timezone for note section
+function formatKathmanduTime(date) {
+  const d = date || new Date();
+  return d.toLocaleDateString('en-US', { timeZone: 'Asia/Kathmandu' }) + ' ' + 
+         d.toLocaleTimeString('en-US', { timeZone: 'Asia/Kathmandu', hour: '2-digit', minute: '2-digit' });
+}
+
+// Parse API datetime as UTC when the server sends naive ISO (no Z). Otherwise JS treats it as local and times are wrong.
 function parseDateAsUTC(value) {
-  if (value instanceof Date) return value;
+  if (value instanceof Date) return isNaN(value.getTime()) ? null : value;
   if (value == null || value === "") return null;
   const s = String(value).trim();
   if (!s) return null;
@@ -3825,17 +4401,23 @@ let currentTargetDetailScans = [];
 async function fetchTargetScans(target) {
   try {
     // Get all scans for the specific target
-    const response = await fetch(getApiUrl("/api/scans"));
+    const response = await fetch(getApiUrl("/api/scans?page=1&page_size=100"));
     const data = await response.json();
     
     // Handle both array and object with 'scans' property
     const allScans = Array.isArray(data) ? data : data.scans || [];
     
-    // Filter scans for the specific target
-    const targetScans = allScans.filter(scan => scan.target === target);
+    // Normalize the target key for comparison
+    const normalizedTarget = normalizeTargetKey(target);
+    
+    // Filter scans for the specific target using normalized comparison
+    const targetScans = allScans.filter(scan => {
+      const scanTarget = normalizeTargetKey(scan.target || "");
+      return scanTarget === normalizedTarget;
+    });
     
     // Sort by creation date, newest first
-    targetScans.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+    targetScans.sort((a, b) => parseDateAsUTC(b.created_at) - parseDateAsUTC(a.created_at));
     
     // For each scan, fetch its findings
     for (const scan of targetScans) {
@@ -4076,7 +4658,7 @@ function populateTargetDetailModal(target, targetScans) {
   // Get last scan date
   let lastScanDate = "-";
   if (targetScans.length > 0 && targetScans[0].created_at) {
-    lastScanDate = formatDate(new Date(targetScans[0].created_at));
+    lastScanDate = formatDate(targetScans[0].created_at);
   }
   
   // Update stats
@@ -4090,6 +4672,8 @@ function populateTargetDetailModal(target, targetScans) {
     `Total scans: ${totalScans} · Total findings: ${totalFindings} · Highest severity: ${highestSeverity}`;
   
   currentTargetDetailScans = targetScans;
+  // Cache scans globally for timestamp lookup in renderScanSummary
+  window.cachedTargetScans = targetScans;
   const severitySel = document.getElementById("findingsSeverityFilter");
   if (severitySel) severitySel.value = "all";
   populateFindingsAttackTypeDropdown();
@@ -4109,7 +4693,7 @@ function populateTargetDetailModal(target, targetScans) {
       <p><strong>Total Findings:</strong> ${totalFindings}</p>
       <p><strong>Highest Severity:</strong> ${highestSeverity}</p>
       <p><strong>Last Scan:</strong> ${lastScanDate}</p>
-      <p><strong>First Scan:</strong> ${targetScans.length > 0 ? formatDate(new Date(targetScans[targetScans.length - 1].created_at)) : '-'}</p>
+      <p><strong>First Scan:</strong> ${targetScans.length > 0 ? formatDate(targetScans[targetScans.length - 1].created_at) : '-'}</p>
     `;
   } else {
     document.getElementById("targetScanSummary").innerHTML = `<p>No scan data available for this target.</p>`;
@@ -4129,7 +4713,7 @@ function populateTargetDetailDeleteTab(targetScans, target) {
     return;
   }
   targetScans.forEach(scan => {
-    const dateStr = scan.created_at ? formatDate(new Date(scan.created_at)) : "—";
+    const dateStr = scan.created_at ? formatDate(scan.created_at) : "—";
     const attackName = getOwaspCategoryName(scan.owasp_category) || scan.owasp_category || "—";
     const findingCount = (scan.findings && scan.findings.length) || 0;
     const tr = document.createElement("tr");
@@ -4164,13 +4748,22 @@ async function handleDeleteScanFromDetailModal(scanId) {
           throw new Error(err.detail || "Failed to delete scan");
         }
         showNotification(`✓ Scan #${scanId} deleted successfully`, "success");
+        
+        // Wait briefly to ensure database commit completes
+        await new Promise(resolve => setTimeout(resolve, 300));
+        
+        // Refresh all views
         await refreshScansViews();
         await refreshDashboardCharts();
+        
+        // Fetch updated scans for this target and refresh modal content
         const remaining = await fetchTargetScans(target);
         if (remaining.length === 0) {
+          // No scans left, close modal
           closeTargetDetailModal();
           return;
         }
+        
         const validatedScans = remaining.filter(s => s && typeof s === "object").map(s => ({
           ...s,
           id: s.id || "unknown",
@@ -4182,7 +4775,10 @@ async function handleDeleteScanFromDetailModal(scanId) {
           highest_severity: s.highest_severity,
           tool_runs: s.tool_runs || []
         }));
+        
+        // Update modal with fresh data
         populateTargetDetailModal(target, validatedScans);
+        initializeTargetCharts(validatedScans);
         initializeComparisonSelectors(validatedScans);
       } catch (err) {
         console.error("Error deleting scan:", err);
@@ -4219,7 +4815,7 @@ function populateFindingsScanIdDropdown(targetScans) {
   (targetScans || []).forEach(scan => {
     const opt = document.createElement("option");
     opt.value = String(scan.id);
-    const dateTime = scan.created_at ? formatDate(new Date(scan.created_at)) : "—";
+    const dateTime = scan.created_at ? formatDate(scan.created_at) : "—";
     const attackName = getOwaspCategoryName(scan.owasp_category) || scan.owasp_category || "—";
     opt.textContent = `#${scan.id} · ${dateTime} · ${attackName}`;
     sel.appendChild(opt);
@@ -4285,20 +4881,68 @@ function populateFindingsTable(targetScans, severityFilter, attackTypeFilter, sc
   
   toShow.forEach(finding => {
     const tr = document.createElement("tr");
-    const findingText = finding.location || finding.description || finding.title || finding.name || "—";
-    const safeFindingText = String(findingText).replace(/</g, "&lt;").replace(/>/g, "&gt;").trim() || "—";
-    let sevClass = "tag-low";
+    const isNuclei = (finding.tool_used || "").toLowerCase() === "nuclei";
+    const hasTemplateDetails = isNuclei && (finding.template_id || finding.extracted_results);
+    
+    // Calculate severity class
     const sev = (finding.severity || "").toLowerCase();
+    let sevClass = "tag-low";
     if (sev === "critical") sevClass = "tag-critical";
     else if (sev === "high") sevClass = "tag-high";
     else if (sev === "medium") sevClass = "tag-medium";
-    else if (sev === "info") sevClass = "tag-info";
+    
+    // Build enhanced content for Nuclei findings with template details
+    let cellContent = "";
+    if (hasTemplateDetails) {
+      // Enhanced Nuclei finding card layout
+      const severityIcon = {
+        "critical": "🔴",
+        "high": "🟠",
+        "medium": "🟡",
+        "low": "🔵",
+        "info": "⚪"
+      }[sev] || "⚪";
+      
+      cellContent = `
+        <div class="nuclei-finding-card">
+          <div class="nuclei-finding-header">
+            <span class="nuclei-severity-icon ${sevClass}">${severityIcon}</span>
+            <strong class="nuclei-description">${escapeHtml(finding.description)}</strong>
+          </div>
+          
+          ${finding.template_id ? `
+            <div class="nuclei-template-section">
+              <span class="nuclei-template-badge">🏷️ Template: ${escapeHtml(finding.template_id)}</span>
+              ${finding.matcher_name ? `
+                <span class="nuclei-matcher-badge">Match: ${escapeHtml(finding.matcher_name)}</span>
+              ` : ''}
+            </div>
+          ` : ''}
+          
+          ${finding.extracted_results ? `
+            <div class="nuclei-extracted-results">
+              <strong>Extracted:</strong> 
+              <code>${escapeHtml(finding.extracted_results)}</code>
+            </div>
+          ` : ''}
+          
+          <div class="nuclei-finding-meta">
+            <span class="nuclei-location">📍 ${escapeHtml(finding.location)}</span>
+          </div>
+        </div>
+      `;
+    } else {
+      // Standard layout for non-Nuclei or simple findings
+      const findingText = finding.location || finding.description || finding.title || finding.name || "—";
+      cellContent = String(findingText).replace(/</g, "&lt;").replace(/>/g, "&gt;").trim() || "—";
+    }
+    
     tr.innerHTML = `
-      <td title="${(finding.description || "").replace(/"/g, "&quot;")}">${safeFindingText}</td>
+      <td title="${(finding.description || "").replace(/"/g, "&quot;")}">${cellContent}</td>
       <td><span class="tag ${sevClass}">${finding.severity || "N/A"}</span></td>
       <td>${finding.attack_type || "N/A"}</td>
       <td>${finding.tool_used || "N/A"}</td>
-      <td>${finding.scan_date ? formatDate(new Date(finding.scan_date)) : "N/A"}</td>
+      <td>${finding.scan_date ? formatDate(finding.scan_date) : "N/A"}</td>
     `;
     tbody.appendChild(tr);
   });
@@ -4317,7 +4961,7 @@ function renderTargetTimeline(targetScans) {
   }
 
   // Sort scans by date (oldest first for timeline)
-  const sortedScans = [...targetScans].sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+  const sortedScans = [...targetScans].sort((a, b) => parseDateAsUTC(a.created_at) - parseDateAsUTC(b.created_at));
 
   const timeline = document.createElement("div");
   timeline.className = "timeline-inner";
@@ -4343,7 +4987,7 @@ function renderTargetTimeline(targetScans) {
         <div class="timeline-marker-dot"></div>
       </div>
       <div class="timeline-content">
-        <div class="timeline-date">${formatDate(new Date(scan.created_at))}</div>
+        <div class="timeline-date">${formatDate(scan.created_at)}</div>
         <div class="timeline-title">Scan #${scan.id != null ? scan.id : "N/A"} · ${attackTypeName}</div>
         <div class="timeline-description timeline-tags">
           <span class="tag ${statusClass}">${scan.status || "Unknown"}</span>
@@ -4386,7 +5030,7 @@ function initializeComparisonSelectors(targetScans) {
   
   // Add options: scan id, date/time, attack type name (so user knows which target/type is compared)
   targetScans.forEach(scan => {
-    const dateTime = formatDate(new Date(scan.created_at));
+    const dateTime = formatDate(scan.created_at);
     const attackTypeName = getOwaspCategoryName(scan.owasp_category) || scan.owasp_category || "N/A";
     const optionText = `#${scan.id} · ${dateTime} · ${attackTypeName}`;
 
@@ -4470,7 +5114,7 @@ async function generateTargetPdfReport(target, targetScans) {
             ${targetScans.map(scan => `
               <tr>
                 <td style="padding: 8px; border: 1px solid #d1d5db;">${scan.id?.substring(0, 8) || 'N/A'}</td>
-                <td style="padding: 8px; border: 1px solid #d1d5db;">${formatDate(new Date(scan.created_at))}</td>
+                <td style="padding: 8px; border: 1px solid #d1d5db;">${formatDate(scan.created_at)}</td>
                 <td style="padding: 8px; border: 1px solid #d1d5db;">${scan.status || 'N/A'}</td>
                 <td style="padding: 8px; border: 1px solid #d1d5db;">
                   <span style="padding: 2px 6px; border-radius: 12px; background-color: ${scan.highest_severity?.toLowerCase() === 'critical' ? '#fee2e2' : scan.highest_severity?.toLowerCase() === 'high' ? '#fed7aa' : scan.highest_severity?.toLowerCase() === 'medium' ? '#fef3c7' : '#e5e7eb'};">
@@ -4517,7 +5161,7 @@ async function generateTargetPdfReport(target, targetScans) {
                   </span>
                 </div>
                 <div style="font-size: 14px; color: #6b7280; margin-bottom: 5px;">
-                  Tool: ${finding.tool_used || 'N/A'} | Date: ${formatDate(new Date(finding.scan_date))}
+                  Tool: ${finding.tool_used || 'N/A'} | Date: ${formatDate(finding.scan_date)}
                 </div>
                 <div style="font-size: 14px; color: #4b5563;">
                   ${finding.description || finding.details || 'No description provided.'}
@@ -4589,6 +5233,117 @@ function loadScript(src) {
   });
 }
 
+const severityOrder = { critical: 5, high: 4, medium: 3, low: 2, info: 1 };
+
+function normalizeFindingValue(value) {
+  return (value || "").toString().trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function getFindingKey(f) {
+  const location = normalizeFindingValue(f.location);
+  const description = normalizeFindingValue(f.description);
+  const type = normalizeFindingValue(f.type);
+  const severity = normalizeFindingValue(f.severity);
+
+  if (location || description) {
+    return `${location}||${description}`;
+  }
+  return `${type}||${severity}||${normalizeFindingValue(f.tool_name)}`;
+}
+
+function dedupeFindingsByKey(findings) {
+  const seen = new Map();
+  findings.forEach(f => {
+    const key = getFindingKey(f);
+    const toolName = (f.tool_name || "Unknown").toString().trim();
+    const existing = seen.get(key);
+    if (!existing) {
+      seen.set(key, {
+        ...f,
+        tool_name: toolName,
+        tool_names: [toolName]
+      });
+      return;
+    }
+
+    if (!existing.tool_names.includes(toolName)) {
+      existing.tool_names.push(toolName);
+      existing.tool_name = existing.tool_names.join(" / ");
+    }
+
+    const existingSeverityRank = severityOrder[(existing.severity || "").toLowerCase()] || 0;
+    const newSeverityRank = severityOrder[(f.severity || "").toLowerCase()] || 0;
+    if (newSeverityRank > existingSeverityRank) {
+      existing.severity = f.severity;
+    }
+  });
+  return Array.from(seen.values());
+}
+
+function sortFindingsBySeverity(findings, desc = true) {
+  return findings.slice().sort((a, b) => {
+    const aRank = severityOrder[(a.severity || "").toLowerCase()] || 0;
+    const bRank = severityOrder[(b.severity || "").toLowerCase()] || 0;
+    return desc ? bRank - aRank : aRank - bRank;
+  });
+}
+
+function buildComparisonState(firstFindings, secondFindings) {
+  const firstMap = new Map(firstFindings.map(f => [getFindingKey(f), f]));
+  const secondMap = new Map(secondFindings.map(f => [getFindingKey(f), f]));
+  const commonFindings = [];
+  const uniqueToFirst = [];
+  const uniqueToSecond = [];
+
+  firstMap.forEach((firstFinding, key) => {
+    const secondFinding = secondMap.get(key);
+    if (secondFinding) {
+      const mergedToolNames = Array.from(new Set([...(firstFinding.tool_names || [firstFinding.tool_name]), ...(secondFinding.tool_names || [secondFinding.tool_name])]));
+      commonFindings.push({
+        ...firstFinding,
+        tool_name: mergedToolNames.join(" / "),
+        tool_names: mergedToolNames,
+        severity: severityOrder[(secondFinding.severity || "").toLowerCase()] > severityOrder[(firstFinding.severity || "").toLowerCase()] ? secondFinding.severity : firstFinding.severity
+      });
+    } else {
+      uniqueToFirst.push(firstFinding);
+    }
+  });
+
+  secondMap.forEach((secondFinding, key) => {
+    if (!firstMap.has(key)) {
+      uniqueToSecond.push(secondFinding);
+    }
+  });
+
+  return {
+    commonFindings: sortFindingsBySeverity(commonFindings),
+    uniqueToFirst: sortFindingsBySeverity(uniqueToFirst),
+    uniqueToSecond: sortFindingsBySeverity(uniqueToSecond),
+    hasNewHighCritical: uniqueToSecond.some(f => ["critical", "high"].includes((f.severity || "").toLowerCase()))
+  };
+}
+
+function getComparisonTableRows(findings) {
+  return findings.map(f => {
+    const formattedDescription = formatComparisonDescription(f.description, f.location);
+    return `
+      <tr>
+        <td>
+          <span class="tag ${f.severity?.toLowerCase() === 'critical' ? 'tag-critical' : f.severity?.toLowerCase() === 'high' ? 'tag-high' : f.severity?.toLowerCase() === 'medium' ? 'tag-medium' : f.severity?.toLowerCase() === 'low' ? 'tag-low' : 'tag-info'}">
+            ${f.severity || 'N/A'}
+          </span>
+        </td>
+        <td>${escapeHtml(f.tool_name || 'N/A')}</td>
+        <td><code class="finding-location">${escapeHtml(f.location || '')}</code></td>
+        <td>${escapeHtml(formattedDescription)}</td>
+        <td>${getRiskExplanationForSeverity(f.severity)}</td>
+      </tr>
+    `;
+  }).join('');
+}
+
+
 // Function to perform scan comparison
 async function performScanComparison() {
   const firstSelect = document.getElementById("firstScanSelect");
@@ -4643,22 +5398,17 @@ async function performScanComparison() {
     // Normalize findings arrays
     const firstFindingsArray = Array.isArray(firstFindings) ? firstFindings : firstFindings.findings || [];
     const secondFindingsArray = Array.isArray(secondFindings) ? secondFindings : secondFindings.findings || [];
-    
-    // Convert findings to sets for easier comparison (using title as identifier)
-    const firstTitles = new Set(firstFindingsArray.map(f => f.title || f.name || f.id));
-    const secondTitles = new Set(secondFindingsArray.map(f => f.title || f.name || f.id));
-    
-    // Find common, unique to first, and unique to second
-    const commonFindings = firstFindingsArray.filter(f => secondTitles.has(f.title || f.name || f.id));
-    const uniqueToFirst = firstFindingsArray.filter(f => !secondTitles.has(f.title || f.name || f.id));
-    const uniqueToSecond = secondFindingsArray.filter(f => !firstTitles.has(f.title || f.name || f.id));
+
+    const firstDeduped = dedupeFindingsByKey(firstFindingsArray);
+    const secondDeduped = dedupeFindingsByKey(secondFindingsArray);
+    const comparisonData = buildComparisonState(firstDeduped, secondDeduped);
     
     // Build per-tool output summaries from findings for each scan
-    const firstToolOutputs = buildToolOutputsFromFindings(firstFindingsArray);
-    const secondToolOutputs = buildToolOutputsFromFindings(secondFindingsArray);
+    const firstToolOutputs = buildToolOutputsFromFindings(firstDeduped);
+    const secondToolOutputs = buildToolOutputsFromFindings(secondDeduped);
     
     // Render comparison results
-    renderComparisonResults(firstScan, secondScan, commonFindings, uniqueToFirst, uniqueToSecond, firstToolOutputs, secondToolOutputs);
+    renderComparisonResults(firstScan, secondScan, comparisonData, firstToolOutputs, secondToolOutputs);
     
   } catch (error) {
     console.error("Error comparing scans:", error);
@@ -4671,13 +5421,27 @@ function buildToolOutputsFromFindings(findingsArray) {
   const outputsByTool = {};
   findingsArray.forEach(f => {
     const tool = f.tool_name || "Unknown";
-    const loc = f.location || "";
-    const desc = f.description || "";
+    const loc = (f.location || "").toString().trim();
+    const desc = (f.description || "").toString().trim();
     let line = "";
-    if (loc && desc) line = `${loc} – ${desc}`;
-    else if (loc) line = loc;
-    else if (desc) line = desc;
-    else line = f.id || "";
+    if (loc && desc) {
+      const lowerLoc = loc.toLowerCase();
+      const lowerDesc = desc.toLowerCase();
+      const subdomainMatch = desc.match(/^subdomain discovered:\s*(.+)$/i);
+      if (subdomainMatch && normalizeFindingValue(subdomainMatch[1]) === normalizeFindingValue(loc)) {
+        line = loc;
+      } else if ((lowerDesc.includes(lowerLoc) || lowerLoc.includes(lowerDesc)) && !lowerDesc.startsWith("open port:")) {
+        line = loc;
+      } else {
+        line = `${loc} – ${desc}`;
+      }
+    } else if (loc) {
+      line = loc;
+    } else if (desc) {
+      line = desc;
+    } else {
+      line = f.id || "";
+    }
     if (!line) return;
     if (!outputsByTool[tool]) outputsByTool[tool] = [];
     // Avoid exact duplicates
@@ -4685,11 +5449,116 @@ function buildToolOutputsFromFindings(findingsArray) {
       outputsByTool[tool].push(line);
     }
   });
-  // Join arrays into multiline strings for display
-  Object.keys(outputsByTool).forEach(tool => {
-    outputsByTool[tool] = outputsByTool[tool].join("\n");
-  });
   return outputsByTool;
+}
+
+function formatComparisonDescription(desc, location) {
+  const normalizedLocation = normalizeFindingValue(location);
+  const cleaned = (desc || "").toString().trim();
+  const subdomainMatch = cleaned.match(/^subdomain discovered:\s*(.+)$/i);
+  if (subdomainMatch) {
+    const found = normalizeFindingValue(subdomainMatch[1]);
+    if (found === normalizedLocation) {
+      return "Subdomain";
+    }
+  }
+  if (normalizedLocation && normalizeFindingValue(cleaned) === normalizedLocation) {
+    return "Subdomain";
+  }
+  return cleaned;
+}
+
+function renderToolOutputList(lines) {
+  if (!lines || lines.length === 0) {
+    return `<span class="tool-output-empty">No output recorded</span>`;
+  }
+  return `<ul class="tool-output-list">${lines.map(line => `<li class="tool-output-item"><code>${escapeHtml(line)}</code></li>`).join('')}</ul>`;
+}
+
+function renderScanComparisonChart(findingsByTool, canvasId, findingsContainerId) {
+  const canvas = document.getElementById(canvasId);
+  const container = document.getElementById(findingsContainerId);
+  if (!canvas || !container) return;
+  container.dataset.activeTool = '';
+  container.innerHTML = '';
+
+  const labels = Object.keys(findingsByTool);
+  const data = labels.map(tool => findingsByTool[tool].length);
+  const backgroundColor = [
+    '#2563eb', '#16a34a', '#f97316', '#e11d48', '#1d4ed8', '#0ea5e9', '#7c3aed', '#64748b'
+  ];
+
+  if (!window.scanComparisonCharts) {
+    window.scanComparisonCharts = {};
+  }
+  if (window.scanComparisonCharts[canvasId]) {
+    window.scanComparisonCharts[canvasId].destroy();
+  }
+
+  const chart = new Chart(canvas, {
+    type: 'doughnut',
+    data: {
+      labels,
+      datasets: [{
+        data,
+        backgroundColor: labels.map((_, idx) => backgroundColor[idx % backgroundColor.length]),
+        borderColor: '#0f172a',
+        borderWidth: 2,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: {
+          position: 'bottom',
+          labels: {
+            boxWidth: 12,
+            padding: 12,
+            color: '#e5e7eb',
+          },
+          onClick: (evt, legendItem, chartInstance) => {
+            const toolName = chartInstance.data.labels[legendItem.index];
+            toggleScanComparisonToolSelection(toolName, findingsByTool, findingsContainerId);
+          }
+        },
+        tooltip: {
+          callbacks: {
+            label: (context) => `${context.label}: ${context.parsed} findings`
+          }
+        }
+      },
+      onClick: (evt, elements) => {
+        if (!elements.length) return;
+        const index = elements[0].index;
+        const toolName = chart.data.labels[index];
+        toggleScanComparisonToolSelection(toolName, findingsByTool, findingsContainerId);
+      }
+    }
+  });
+
+  window.scanComparisonCharts[canvasId] = chart;
+}
+
+function toggleScanComparisonToolSelection(toolName, findingsByTool, findingsContainerId) {
+  const container = document.getElementById(findingsContainerId);
+  if (!container) return;
+
+  const activeTool = container.dataset.activeTool === toolName ? '' : toolName;
+  container.dataset.activeTool = activeTool;
+
+  if (!activeTool) {
+    container.innerHTML = '';
+    return;
+  }
+
+  const lines = findingsByTool[activeTool] || [];
+  container.innerHTML = `
+    <div class="scan-chart-findings-header">
+      <strong>${escapeHtml(activeTool)}</strong> · ${lines.length} ${lines.length === 1 ? 'finding' : 'findings'}
+    </div>
+    ${renderToolOutputList(lines)}
+  `;
 }
 
 // Helper: human-readable risk explanation based on severity
@@ -4712,11 +5581,11 @@ function getRiskExplanationForSeverity(severity) {
 }
 
 // Function to render comparison results
-function renderComparisonResults(firstScan, secondScan, commonFindings, uniqueToFirst, uniqueToSecond, firstToolOutputs, secondToolOutputs) {
+function renderComparisonResults(firstScan, secondScan, comparisonData, firstToolOutputs, secondToolOutputs) {
   const resultDiv = document.getElementById("scanComparisonResult");
   
-  const firstDate = formatDate(new Date(firstScan.created_at));
-  const secondDate = formatDate(new Date(secondScan.created_at));
+  const firstDate = formatDate(firstScan.created_at);
+  const secondDate = formatDate(secondScan.created_at);
   const firstAttackType = firstScan.owasp_category_name || firstScan.owasp_category || "N/A";
   const secondAttackType = secondScan.owasp_category_name || secondScan.owasp_category || "N/A";
   
@@ -4734,191 +5603,122 @@ function renderComparisonResults(firstScan, secondScan, commonFindings, uniqueTo
     <div class="grid grid-3">
       <div class="comparison-stat-card">
         <div class="stat-label">Common Findings</div>
-        <div class="stat-value" style="color: #3b82f6;">${commonFindings.length}</div>
+        <div class="stat-value" style="color: #3b82f6;">${comparisonData.commonFindings.length}</div>
         <div class="stat-foot">Identical findings</div>
       </div>
       <div class="comparison-stat-card">
         <div class="stat-label">New in Scan 2</div>
-        <div class="stat-value" style="color: #ef4444;">${uniqueToSecond.length}</div>
+        <div class="stat-value" style="color: #ef4444;">${comparisonData.uniqueToSecond.length}</div>
         <div class="stat-foot">Findings introduced</div>
       </div>
       <div class="comparison-stat-card">
-        <div class="stat-label">Fixed from Scan 1</div>
-        <div class="stat-value" style="color: #10b981;">${uniqueToFirst.length}</div>
-        <div class="stat-foot">Findings resolved</div>
+        <div class="stat-label">Not detected in Scan 2</div>
+        <div class="stat-value" style="color: #10b981;">${comparisonData.uniqueToFirst.length}</div>
+        <div class="stat-foot">Coverage gap / no longer detected</div>
       </div>
     </div>
 
+    ${!comparisonData.hasNewHighCritical && comparisonData.uniqueToSecond.length ? `<div class="comparison-note">No high/critical new findings were introduced in Scan 2.</div>` : ''}
+
     <div class="comparison-scan-summary">
       <h5>Scan Details</h5>
-      <div class="grid grid-2 comparison-scan-columns">
-        <div class="comparison-section">
-          <div class="comparison-scan-column-title">Scan 1: ${firstAttackType}</div>
-          <div class="comparison-scan-meta">
-            Status: ${firstScan.status || "N/A"} · Tools executed: ${(firstScan.tool_runs || []).length}
+      <div class="scan-comparison-chart-row">
+        <div class="scan-chart-card">
+          <div class="scan-chart-card-header">
+            <div>
+              <div class="scan-chart-card-title">Scan 1 — ${firstAttackType}</div>
+              <div class="scan-chart-card-meta">${firstDate} · ${firstScan.status || "N/A"} · ${(firstScan.tool_runs || []).length} tools</div>
+            </div>
           </div>
-          ${(firstScan.tool_runs || []).length > 0 ? `
-          <div class="comparison-table-wrapper">
-            <table class="recon-findings-table comparison-findings-table">
-              <thead>
-                <tr>
-                  <th>Tool</th>
-                  <th>Status</th>
-                  <th>Output</th>
-                </tr>
-              </thead>
-              <tbody>
-                ${(firstScan.tool_runs || []).slice(0, 10).map(tr => `
-                  <tr>
-                    <td>${tr.tool_name || "N/A"}</td>
-                    <td>${tr.status || "N/A"}</td>
-                    <td><div class="comparison-output-cell">${firstToolOutputs[tr.tool_name] || tr.summary || tr.error_message || "No output recorded"}</div></td>
-                  </tr>
-                `).join('')}
-              </tbody>
-            </table>
+          <div class="scan-chart-body">
+            <div class="scan-chart-canvas-wrap"><canvas id="scanComparisonChart1"></canvas></div>
+            <div class="scan-chart-note">Click a slice or legend item to expand that tool's findings below the chart.</div>
+            <div class="scan-chart-findings" id="scanComparisonFindings1">Select a tool slice on the chart above.</div>
           </div>
-          ` : '<div class="no-findings">No tools recorded for this scan</div>'}
         </div>
 
-        <div class="comparison-section">
-          <div class="comparison-scan-column-title">Scan 2: ${secondAttackType}</div>
-          <div class="comparison-scan-meta">
-            Status: ${secondScan.status || "N/A"} · Tools executed: ${(secondScan.tool_runs || []).length}
+        <div class="scan-chart-card">
+          <div class="scan-chart-card-header">
+            <div>
+              <div class="scan-chart-card-title">Scan 2 — ${secondAttackType}</div>
+              <div class="scan-chart-card-meta">${secondDate} · ${secondScan.status || "N/A"} · ${(secondScan.tool_runs || []).length} tools</div>
+            </div>
           </div>
-          ${(secondScan.tool_runs || []).length > 0 ? `
-          <div class="comparison-table-wrapper">
-            <table class="recon-findings-table comparison-findings-table">
-              <thead>
-                <tr>
-                  <th>Tool</th>
-                  <th>Status</th>
-                  <th>Output</th>
-                </tr>
-              </thead>
-              <tbody>
-                ${(secondScan.tool_runs || []).slice(0, 10).map(tr => `
-                  <tr>
-                    <td>${tr.tool_name || "N/A"}</td>
-                    <td>${tr.status || "N/A"}</td>
-                    <td><div class="comparison-output-cell">${secondToolOutputs[tr.tool_name] || tr.summary || tr.error_message || "No output recorded"}</div></td>
-                  </tr>
-                `).join('')}
-              </tbody>
-            </table>
+          <div class="scan-chart-body">
+            <div class="scan-chart-canvas-wrap"><canvas id="scanComparisonChart2"></canvas></div>
+            <div class="scan-chart-note">Click a slice or legend item to expand that tool's findings below the chart.</div>
+            <div class="scan-chart-findings" id="scanComparisonFindings2">Select a tool slice on the chart above.</div>
           </div>
-          ` : '<div class="no-findings">No tools recorded for this scan</div>'}
         </div>
       </div>
     </div>
 
     <div class="comparison-details">
       <div class="comparison-section">
-        <h5>Common Findings (${commonFindings.length})</h5>
-        ${commonFindings.length > 0 ? `
-          <div class="comparison-table-wrapper">
-            <table class="recon-findings-table comparison-findings-table">
-              <thead>
-                <tr>
-                  <th>Severity</th>
-                  <th>Tool</th>
-                  <th>Location</th>
-                  <th>Description</th>
-                  <th>Risk Explanation</th>
-                </tr>
-              </thead>
-              <tbody>
-                ${commonFindings.slice(0, 20).map(f => `
-                  <tr>
-                    <td>
-                      <span class="tag ${f.severity?.toLowerCase() === 'critical' ? 'tag-critical' : f.severity?.toLowerCase() === 'high' ? 'tag-high' : f.severity?.toLowerCase() === 'medium' ? 'tag-medium' : f.severity?.toLowerCase() === 'low' ? 'tag-low' : 'tag-info'}">
-                        ${f.severity || 'N/A'}
-                      </span>
-                    </td>
-                    <td>${f.tool_name || 'N/A'}</td>
-                    <td><code class="finding-location">${(f.location || '').substring(0, 80)}${(f.location || '').length > 80 ? '…' : ''}</code></td>
-                    <td>${(f.description || '').substring(0, 160)}${(f.description || '').length > 160 ? '…' : ''}</td>
-                    <td>${getRiskExplanationForSeverity(f.severity)}</td>
-                  </tr>
-                `).join('')}
-              </tbody>
-            </table>
-            ${commonFindings.length > 20 ? `<div class="more-findings">... and ${commonFindings.length - 20} more</div>` : ''}
-          </div>
-        ` : '<div class="no-findings">No common findings</div>'}
+        <h5>Common Findings (${comparisonData.commonFindings.length})</h5>
+        <div class="comparison-table-wrapper">
+          <table class="recon-findings-table comparison-findings-table">
+            <thead>
+              <tr>
+                <th>Severity</th>
+                <th>Tool</th>
+                <th>Location</th>
+                <th>Description</th>
+                <th>Risk Explanation</th>
+              </tr>
+            </thead>
+            <tbody id="comparisonCommonBody"></tbody>
+          </table>
+          ${comparisonData.commonFindings.length === 0 ? '<div class="no-findings">No common findings</div>' : ''}
+        </div>
       </div>
       
       <div class="comparison-section">
-        <h5>New in Second Scan (${uniqueToSecond.length})</h5>
-        ${uniqueToSecond.length > 0 ? `
-          <div class="comparison-table-wrapper">
-            <table class="recon-findings-table comparison-findings-table">
-              <thead>
-                <tr>
-                  <th>Severity</th>
-                  <th>Tool</th>
-                  <th>Location</th>
-                  <th>Description</th>
-                  <th>Risk Explanation</th>
-                </tr>
-              </thead>
-              <tbody>
-                ${uniqueToSecond.slice(0, 20).map(f => `
-                  <tr>
-                    <td>
-                      <span class="tag ${f.severity?.toLowerCase() === 'critical' ? 'tag-critical' : f.severity?.toLowerCase() === 'high' ? 'tag-high' : f.severity?.toLowerCase() === 'medium' ? 'tag-medium' : f.severity?.toLowerCase() === 'low' ? 'tag-low' : 'tag-info'}">
-                        ${f.severity || 'N/A'}
-                      </span>
-                    </td>
-                    <td>${f.tool_name || 'N/A'}</td>
-                    <td><code class="finding-location">${(f.location || '').substring(0, 80)}${(f.location || '').length > 80 ? '…' : ''}</code></td>
-                    <td>${(f.description || '').substring(0, 160)}${(f.description || '').length > 160 ? '…' : ''}</td>
-                    <td>${getRiskExplanationForSeverity(f.severity)}</td>
-                  </tr>
-                `).join('')}
-              </tbody>
-            </table>
-            ${uniqueToSecond.length > 20 ? `<div class="more-findings">... and ${uniqueToSecond.length - 20} more</div>` : ''}
-          </div>
-        ` : '<div class="no-findings">No new findings in second scan</div>'}
+        <h5>New in Second Scan (${comparisonData.uniqueToSecond.length})</h5>
+        <div class="comparison-table-wrapper">
+          <table class="recon-findings-table comparison-findings-table">
+            <thead>
+              <tr>
+                <th>Severity</th>
+                <th>Tool</th>
+                <th>Location</th>
+                <th>Description</th>
+                <th>Risk Explanation</th>
+              </tr>
+            </thead>
+            <tbody id="comparisonNewBody"></tbody>
+          </table>
+          ${comparisonData.uniqueToSecond.length === 0 ? '<div class="no-findings">No new findings in second scan</div>' : ''}
+        </div>
       </div>
       
       <div class="comparison-section">
-        <h5>Fixed from First Scan (${uniqueToFirst.length})</h5>
-        ${uniqueToFirst.length > 0 ? `
-          <div class="comparison-table-wrapper">
-            <table class="recon-findings-table comparison-findings-table">
-              <thead>
-                <tr>
-                  <th>Severity</th>
-                  <th>Tool</th>
-                  <th>Location</th>
-                  <th>Description</th>
-                  <th>Risk Explanation</th>
-                </tr>
-              </thead>
-              <tbody>
-                ${uniqueToFirst.slice(0, 20).map(f => `
-                  <tr>
-                    <td>
-                      <span class="tag ${f.severity?.toLowerCase() === 'critical' ? 'tag-critical' : f.severity?.toLowerCase() === 'high' ? 'tag-high' : f.severity?.toLowerCase() === 'medium' ? 'tag-medium' : f.severity?.toLowerCase() === 'low' ? 'tag-low' : 'tag-info'}">
-                        ${f.severity || 'N/A'}
-                      </span>
-                    </td>
-                    <td>${f.tool_name || 'N/A'}</td>
-                    <td><code class="finding-location">${(f.location || '').substring(0, 80)}${(f.location || '').length > 80 ? '…' : ''}</code></td>
-                    <td>${(f.description || '').substring(0, 160)}${(f.description || '').length > 160 ? '…' : ''}</td>
-                    <td>${getRiskExplanationForSeverity(f.severity)}<br><span class="comparison-fixed-note">Marked as resolved – not detected in Scan 2.</span></td>
-                  </tr>
-                `).join('')}
-              </tbody>
-            </table>
-            ${uniqueToFirst.length > 20 ? `<div class="more-findings">... and ${uniqueToFirst.length - 20} more</div>` : ''}
-          </div>
-        ` : '<div class="no-findings">No findings fixed/resolved</div>'}
+        <h5>Not detected in Scan 2 (${comparisonData.uniqueToFirst.length})</h5>
+        <div class="comparison-table-wrapper">
+          <table class="recon-findings-table comparison-findings-table">
+            <thead>
+              <tr>
+                <th>Severity</th>
+                <th>Tool</th>
+                <th>Location</th>
+                <th>Description</th>
+                <th>Risk Explanation</th>
+              </tr>
+            </thead>
+            <tbody id="comparisonNotDetectedBody"></tbody>
+          </table>
+          ${comparisonData.uniqueToFirst.length === 0 ? '<div class="no-findings">No findings not detected in Scan 2</div>' : ''}
+        </div>
       </div>
     </div>
   `;
+
+  document.getElementById("comparisonCommonBody").innerHTML = getComparisonTableRows(comparisonData.commonFindings);
+  document.getElementById("comparisonNewBody").innerHTML = getComparisonTableRows(comparisonData.uniqueToSecond);
+  document.getElementById("comparisonNotDetectedBody").innerHTML = getComparisonTableRows(comparisonData.uniqueToFirst);
+
+  renderScanComparisonChart(firstToolOutputs, 'scanComparisonChart1', 'scanComparisonFindings1');
+  renderScanComparisonChart(secondToolOutputs, 'scanComparisonChart2', 'scanComparisonFindings2');
 }
 
 // Function to render severity distribution chart
@@ -4980,7 +5780,8 @@ function renderTargetSeverityChart(targetScans) {
           "#facc15",
           "#60a5fa",
           "#9ca3af"
-        ]
+        ],
+        spacing: 2
       }]
     },
     options: {
@@ -5103,114 +5904,120 @@ function renderTargetCategoryChart(targetScans) {
 // Function to render trend chart
 function renderTargetTrendChart(targetScans) {
   const canvas = document.getElementById("targetTrendChart");
-  if (!canvas) return;
-  
+  const container = document.querySelector(".target-trend-chart-wrap");
+  const inner = document.querySelector(".target-trend-chart-inner");
+  if (!canvas || !container || !inner) return;
+
   const ctx = canvas.getContext("2d");
-  
-  // Destroy existing chart if it exists
+  if (!ctx) return;
+
   if (window.targetTrendChart && typeof window.targetTrendChart.destroy === 'function') {
     window.targetTrendChart.destroy();
   }
-  
-  // Sort scans by date
-  const sortedScans = [...targetScans].sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
-  
-  // Prepare data for the trend chart
-  const dates = sortedScans.map(scan => formatDate(new Date(scan.created_at)));
-  
-  // Count severities by date
-  const criticalData = [];
-  const highData = [];
-  const mediumData = [];
-  const lowData = [];
-  
-  sortedScans.forEach(scan => {
-    let crit = 0, hig = 0, med = 0, lo = 0;
-    
-    if (scan.findings && Array.isArray(scan.findings)) {
-      scan.findings.forEach(finding => {
-        const sev = (finding.severity || "").toLowerCase();
-        if (sev === "critical") crit++;
-        else if (sev === "high") hig++;
-        else if (sev === "medium") med++;
-        else if (sev === "low") lo++;
-      });
-    }
-    
-    criticalData.push(crit);
-    highData.push(hig);
-    mediumData.push(med);
-    lowData.push(lo);
+
+  // Build severity counts per day (YYYY-MM-DD)
+  const countsByDate = {};
+  (targetScans || []).forEach(scan => {
+    const scanDate = parseDateAsUTC(scan.created_at);
+    if (!scanDate || isNaN(scanDate.getTime())) return;
+    const key = `${scanDate.getFullYear()}-${String(scanDate.getMonth()+1).padStart(2, '0')}-${String(scanDate.getDate()).padStart(2, '0')}`;
+    if (!countsByDate[key]) countsByDate[key] = { critical: 0, high: 0, medium: 0, low: 0 };
+
+    (scan.findings || []).forEach(finding => {
+      const sev = (finding.severity || '').toLowerCase();
+      if (sev === 'critical') countsByDate[key].critical += 1;
+      else if (sev === 'high') countsByDate[key].high += 1;
+      else if (sev === 'medium') countsByDate[key].medium += 1;
+      else if (sev === 'low') countsByDate[key].low += 1;
+    });
   });
-  
+
+  // Default date window: show the most recent 10 days; allow scrolling if more than 10 days available.
+  const today = new Date();
+  today.setHours(0,0,0,0);
+  const defaultWindowDays = 10;
+
+  const allDateKeys = Object.keys(countsByDate)
+    .map(d => new Date(d + 'T00:00:00'))
+    .filter(d => !isNaN(d.getTime()))
+    .sort((a,b)=>a-b);
+
+  let dateKeys = [];
+  if (allDateKeys.length === 0) {
+    // no data, generate last 10 days labels
+    for (let i = defaultWindowDays - 1; i >= 0; i--) {
+      const d = new Date(today);
+      d.setDate(today.getDate() - i);
+      dateKeys.push(`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`);
+    }
+  } else {
+    const firstScanDate = allDateKeys[0];
+    const lastScanDate = allDateKeys[allDateKeys.length-1];
+    const endDate = new Date(Math.max(lastScanDate.getTime(), today.getTime()));
+    endDate.setHours(0,0,0,0);
+
+    const startDate = new Date(endDate);
+    startDate.setDate(endDate.getDate() - (defaultWindowDays - 1));
+
+    // if older data exists beyond 10-day default window, keep it for horizontal scroll
+    const earliestDate = firstScanDate < startDate ? firstScanDate : startDate;
+    let iter = new Date(earliestDate);
+    iter.setHours(0,0,0,0);
+
+    const lastLimit = new Date(endDate);
+    while (iter <= lastLimit) {
+      dateKeys.push(`${iter.getFullYear()}-${String(iter.getMonth()+1).padStart(2,'0')}-${String(iter.getDate()).padStart(2,'0')}`);
+      iter.setDate(iter.getDate() + 1);
+    }
+  }
+
+  const labels = dateKeys.map(d => {
+    const parts = d.split('-');
+    if (parts.length !== 3) return d;
+    return `${parts[1]}/${parts[2]}`;
+  });
+
+  const criticalData = dateKeys.map(d => (countsByDate[d] ? countsByDate[d].critical : 0));
+  const highData = dateKeys.map(d => (countsByDate[d] ? countsByDate[d].high : 0));
+  const mediumData = dateKeys.map(d => (countsByDate[d] ? countsByDate[d].medium : 0));
+  const lowData = dateKeys.map(d => (countsByDate[d] ? countsByDate[d].low : 0));
+
+  // Set inner width to stable cell size and 10-day default viewport
+  const cellWidth = 70;
+  const targetWidth = Math.max(dateKeys.length * cellWidth, defaultWindowDays * cellWidth);
+  inner.style.width = `${targetWidth}px`;
+
   window.targetTrendChart = new Chart(ctx, {
     type: "line",
     data: {
-      labels: dates,
+      labels: labels,
       datasets: [
-        {
-          label: "Critical",
-          data: criticalData,
-          borderColor: "#ef4444",
-          backgroundColor: "rgba(239, 68, 68, 0.1)",
-          tension: 0.4,
-          fill: true
-        },
-        {
-          label: "High",
-          data: highData,
-          borderColor: "#f97316",
-          backgroundColor: "rgba(249, 115, 22, 0.1)",
-          tension: 0.4,
-          fill: true
-        },
-        {
-          label: "Medium",
-          data: mediumData,
-          borderColor: "#eab308",
-          backgroundColor: "rgba(234, 179, 8, 0.1)",
-          tension: 0.4,
-          fill: true
-        },
-        {
-          label: "Low",
-          data: lowData,
-          borderColor: "#64748b",
-          backgroundColor: "rgba(100, 116, 139, 0.1)",
-          tension: 0.4,
-          fill: true
-        }
+        { label: "Critical", data: criticalData, borderColor: "#ef4444", backgroundColor: "rgba(239, 68, 68, 0.15)", tension: 0.3, fill: true, pointRadius: 3 },
+        { label: "High", data: highData, borderColor: "#f97316", backgroundColor: "rgba(249, 115, 22, 0.15)", tension: 0.3, fill: true, pointRadius: 3 },
+        { label: "Medium", data: mediumData, borderColor: "#eab308", backgroundColor: "rgba(234, 179, 8, 0.15)", tension: 0.3, fill: true, pointRadius: 3 },
+        { label: "Low", data: lowData, borderColor: "#64748b", backgroundColor: "rgba(100, 116, 139, 0.15)", tension: 0.3, fill: true, pointRadius: 3 }
       ]
     },
     options: {
       responsive: true,
       maintainAspectRatio: false,
       plugins: {
-        legend: {
-          position: "top",
-        },
-        tooltip: {
-          mode: "index",
-          intersect: false
-        }
+        legend: { position: "top" },
+        tooltip: { mode: "index", intersect: false }
       },
       scales: {
-        y: {
-          beginAtZero: true,
-          title: {
-            display: true,
-            text: 'Number of Findings'
-          }
-        },
-        x: {
-          title: {
-            display: true,
-            text: 'Scan Date'
-          }
-        }
+        y: { beginAtZero: true, title: { display: true, text: 'Number of Findings' } },
+        x: { title: { display: true, text: 'Date' }, ticks: { autoSkip: false } }
       }
     }
   });
+
+  // Ensure view defaults to latest date range (last 10 days) for horizontal scroll
+  if (dateKeys.length > defaultWindowDays) {
+    container.scrollLeft = container.scrollWidth;
+  } else {
+    container.scrollLeft = 0;
+  }
 }
 
 /* ===== TOOLS & OWASP TABS ===== */
@@ -5366,6 +6173,13 @@ function initSettings() {
 const ALERT_EMAIL_API = "/api/settings/alert-email";
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+function syncAlertEmailToggleLabel() {
+  const toggle = document.getElementById("alertEmailEnabled");
+  const label = document.querySelector(".alert-email-toggle-label");
+  if (!toggle || !label) return;
+  label.textContent = toggle.checked ? "Disable" : "Enable";
+}
+
 async function loadAlertEmailSettings() {
   const toggle = document.getElementById("alertEmailEnabled");
   const manageBtn = document.getElementById("alertEmailManageBtn");
@@ -5374,10 +6188,12 @@ async function loadAlertEmailSettings() {
     const data = await apiRequest(ALERT_EMAIL_API, { method: "GET" });
     toggle.checked = !!data.enabled;
     manageBtn.classList.toggle("hidden", !data.enabled);
+    syncAlertEmailToggleLabel();
   } catch (e) {
     console.warn("Failed to load alert email settings", e);
     toggle.checked = false;
     manageBtn.classList.add("hidden");
+    syncAlertEmailToggleLabel();
   }
 }
 
@@ -5473,6 +6289,7 @@ function initAlertEmailSettings() {
   if (!toggle) return;
 
   toggle.addEventListener("change", async () => {
+    syncAlertEmailToggleLabel();
     if (toggle.checked) {
       const data = await apiRequest(ALERT_EMAIL_API, { method: "GET" }).catch(() => ({ enabled: false, emails: [] }));
       openAlertEmailModal(data.emails && data.emails.length ? data.emails : [""]);
@@ -5488,6 +6305,7 @@ function initAlertEmailSettings() {
       } catch (e) {
         showNotification(`Failed to save: ${e.message}`, "error");
         toggle.checked = true;
+        syncAlertEmailToggleLabel();
       }
     }
   });
@@ -5534,6 +6352,7 @@ function initAlertEmailSettings() {
       })
       .finally(() => {
         saveBtn.disabled = false;
+        syncAlertEmailToggleLabel();
       });
   }
 
@@ -5554,7 +6373,7 @@ function initAlertEmailSettings() {
 async function refreshScansViews() {
   try {
     // Fetch all scans (including unsaved) for dashboard
-    const result = await fetchScans({}, true);
+    const result = await fetchScans({ page_size: 100 }, true);
     const scans = Array.isArray(result) ? result : result.scans || result.items || [];
     
     // Always keep charts visible and persistent - they show real data from API
@@ -5611,7 +6430,7 @@ async function refreshScansViews() {
 /* ===== REFRESH SAVED REPORTS ===== */
 async function refreshSavedReports() {
   try {
-    const result = await fetchScans({}, false);
+    const result = await fetchScans({ page_size: 100 }, false);
     savedReportsScans = Array.isArray(result) ? result : result.scans || result.items || [];
     applyReportsFilters();
   } catch (e) {
@@ -5887,14 +6706,14 @@ function renderScheduledScanResultsTable(list) {
           : '<button type="button" class="tool-run-btn save-report-btn" data-action="save-scan-report" data-id="' + scan.id + '" title="Save to Saved Reports">Save Report</button>')
       : "";
     tr.innerHTML = `
-      <td>${scan.id}</td>
-      <td>${scan.target || "—"}</td>
-      <td>${getOwaspCategoryName(scan.owasp_category) || scan.owasp_category}</td>
-      <td><span class="tag ${sevClass}">${scan.highest_severity || "—"}</span></td>
-      <td>${scan.finding_count ?? 0}</td>
-      <td><span class="badge-status ${statusClass}">${scan.status || "—"}</span></td>
-      <td>${created}</td>
-      <td>
+      <td style="min-width: 100px; white-space: nowrap;">${scan.id}</td>
+      <td style="min-width: 200px; white-space: nowrap;" title="${scan.target || ""}">${scan.target || "—"}</td>
+      <td style="min-width: 250px; white-space: nowrap;" title="${getOwaspCategoryName(scan.owasp_category) || scan.owasp_category || ""}">${getOwaspCategoryName(scan.owasp_category) || scan.owasp_category}</td>
+      <td style="min-width: 150px; white-space: nowrap;"><span class="tag ${sevClass}">${scan.highest_severity || "—"}</span></td>
+      <td style="min-width: 80px; text-align: center; white-space: nowrap;">${scan.finding_count ?? 0}</td>
+      <td style="min-width: 180px; white-space: nowrap;"><span class="badge-status ${statusClass}">${scan.status || "—"}</span></td>
+      <td style="min-width: 240px; white-space: nowrap;" title="${created}">${created}</td>
+      <td style="min-width: 280px; white-space: nowrap;">
         <div class="actions-cell">
           <a href="${getApiUrl(API_ROUTES.reportHtml(scan.id))}" target="_blank" rel="noopener" class="tool-run-btn">View Report</a>
           ${saveBtn}
@@ -6105,18 +6924,88 @@ function initScheduledScansPage() {
   }
   const form = document.getElementById("scheduledScanForm");
   if (form) {
+    // Add input listeners to validate and update button state
+    const targetInput = document.getElementById("scheduleTarget");
+    const owaspSel = document.getElementById("scheduleOwasp");
+    const toolGrid = document.getElementById("scheduleToolGrid");
+    const submitBtn = document.querySelector(".schedule-submit-btn");
+    
+    // Function to validate form and update button state
+    function validateScheduleForm() {
+      const target = (targetInput?.value || "").trim();
+      const owasp = owaspSel?.value;
+      const tools = getScheduleSelectedTools();
+      const frequency = getScheduleRepeatType();
+      const scheduleOn = isScheduleToggleOn();
+      
+      let isValid =
+        target &&
+        owasp &&
+        tools.length > 0 &&
+        isValidTarget(target);
+
+      // One-time and monthly need date/time set
+      if (isValid && (frequency === "once" || frequency === "monthly")) {
+        isValid = scheduleOn && scheduleChosenNextRunAt;
+      }
+      
+      // Update button appearance
+      if (submitBtn) {
+        if (isValid) {
+          submitBtn.style.background = "linear-gradient(135deg, #3b82f6, #2563eb)";
+          submitBtn.style.boxShadow = "0 12px 22px rgba(59, 130, 246, 0.7)";
+          submitBtn.disabled = false;
+        } else {
+          submitBtn.style.background = "linear-gradient(135deg, #1d283a, #2a3a52)";
+          submitBtn.style.boxShadow = "0 12px 22px rgba(15, 23, 42, 0.7)";
+          submitBtn.disabled = true;
+        }
+      }
+      
+      return isValid;
+    }
+    
+    // Add event listeners for real-time validation
+    targetInput?.addEventListener("input", validateScheduleForm);
+    owaspSel?.addEventListener("change", validateScheduleForm);
+    toolGrid?.addEventListener("click", (e) => {
+      if (e.target.classList.contains("schedule-tool-pill")) {
+        setTimeout(validateScheduleForm, 10);
+      }
+    });
+    
+    // Listen for repeat pill changes
+    document.querySelectorAll(".schedule-repeat-pill").forEach(pill => {
+      pill.addEventListener("click", () => {
+        setTimeout(validateScheduleForm, 10);
+      });
+    });
+    
+    // Listen for schedule toggle changes
+    const scheduleToggle = document.getElementById("scheduleToggleBtn");
+    scheduleToggle?.addEventListener("click", () => {
+      setTimeout(validateScheduleForm, 100);
+    });
+    
+    // Initial validation
+    validateScheduleForm();
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
-      let target = (document.getElementById("scheduleTarget")?.value || "").trim().toLowerCase();
-      target = target.replace(/^https?:\/\//, "").replace(/\/$/, "");
+      const rawTarget = (document.getElementById("scheduleTarget")?.value || "").trim();
       const owasp = document.getElementById("scheduleOwasp")?.value;
       const tools = getScheduleSelectedTools();
       const frequency = getScheduleRepeatType();
       const scheduleOn = isScheduleToggleOn();
-      if (!target || !owasp || tools.length === 0) {
+      if (!rawTarget || !owasp || tools.length === 0) {
         showNotification("Enter target, select category, and at least one tool.", "error");
         return;
       }
+      if (!isValidTarget(rawTarget)) {
+        showNotification("Please enter a valid target (domain, IP, or URL).", "error");
+        return;
+      }
+      let target = rawTarget.toLowerCase();
+      target = target.replace(/^https?:\/\//, "").replace(/\/$/, "");
       const needsDateTime = frequency === "once" || frequency === "monthly";
       if (needsDateTime && (!scheduleOn || !scheduleChosenNextRunAt)) {
         showNotification("One-time and Monthly need a date & time. Turn on Schedule, set when to run, then click \"Set schedule\".", "error");

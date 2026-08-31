@@ -89,6 +89,20 @@ def _ensure_report_html_column(sync_conn):
         sync_conn.execute(text("ALTER TABLE scans ADD COLUMN report_html TEXT"))
 
 
+def _ensure_endpoint_classification_column(sync_conn):
+    """Add scans.endpoint_classification if missing (intelligence layer data)."""
+    if getattr(sync_conn.dialect, "name", None) != "sqlite":
+        return
+    try:
+        result = sync_conn.execute(text("PRAGMA table_info(scans)"))
+        rows = result.fetchall()
+    except Exception:
+        return
+    cols = [row[1] for row in rows]
+    if "endpoint_classification" not in cols:
+        sync_conn.execute(text("ALTER TABLE scans ADD COLUMN endpoint_classification TEXT"))
+
+
 async def init_db() -> None:
     """Initialize database tables."""
     from app.models import scan, tool_run, finding, scheduled_scan  # Import models to register them
@@ -98,5 +112,6 @@ async def init_db() -> None:
         await conn.run_sync(_ensure_scheduled_scan_id_column)
         await conn.run_sync(_ensure_scheduled_scans_next_run_at)
         await conn.run_sync(_ensure_report_html_column)
+        await conn.run_sync(_ensure_endpoint_classification_column)
 
 

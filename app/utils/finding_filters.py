@@ -1,5 +1,7 @@
 """Filters for excluding noise from tool findings (e.g. Sublist3r banner/log lines)."""
 import re
+from typing import Optional, Tuple
+from urllib.parse import urlparse
 
 # ANSI escape sequences (real \x1b and literal "[91m" style when stored in DB)
 _ANSI = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]?")
@@ -47,3 +49,33 @@ def is_sublist3r_noise(location: str, description: str) -> bool:
     if not re.match(r"^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$", loc_clean):
         return True
     return False
+
+
+def extract_host_port(location: str) -> Tuple[str, Optional[str]]:
+    """
+    Extract host and port from a location URL.
+    
+    Returns:
+        Tuple of (host, port) where port may be None
+    """
+    if not location:
+        return ("", None)
+    
+    # Try parsing as URL
+    if location.startswith("http://") or location.startswith("https://"):
+        try:
+            parsed = urlparse(location)
+            host = parsed.hostname or parsed.netloc.split(":")[0]
+            port = parsed.port
+            return (host, str(port) if port else None)
+        except Exception:
+            pass
+    
+    # Handle bare host:port format
+    if ":" in location:
+        parts = location.rsplit(":", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            return (parts[0], parts[1])
+    
+    # Just hostname
+    return (location, None)

@@ -30,7 +30,11 @@ class Settings:
     
     # Tool execution settings
     TOOL_TIMEOUT: int = int(os.getenv("TOOL_TIMEOUT", "300"))  # 5 minutes default
-    NUCLEI_TIMEOUT: int = int(os.getenv("NUCLEI_TIMEOUT", "1500"))  # ~25 min for Nuclei; set via env to override
+    NUCLEI_TIMEOUT: int = int(os.getenv("NUCLEI_TIMEOUT", "1800"))  # 30 minutes base for OWASP-focused scans
+    NUCLEI_REQUEST_TIMEOUT: int = int(os.getenv("NUCLEI_REQUEST_TIMEOUT", "5"))
+    NUCLEI_RETRIES: int = int(os.getenv("NUCLEI_RETRIES", "0"))
+    NUCLEI_MAX_URLS: int = int(os.getenv("NUCLEI_MAX_URLS", "60"))
+    NUCLEI_STOP_ON_FINDINGS: int = int(os.getenv("NUCLEI_STOP_ON_FINDINGS", "1"))
     MAX_CONCURRENT_TOOLS: int = int(os.getenv("MAX_CONCURRENT_TOOLS", "3"))
     
     # Recon tools - canonical names

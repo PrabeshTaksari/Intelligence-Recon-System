@@ -45,6 +45,9 @@ class Scan(BaseModel):
     # Persisted AI-generated report HTML; once set, View Report never calls AI again for this scan
     report_html = Column(Text, nullable=True)
 
+    # Intelligence layer data - endpoint classification results
+    endpoint_classification = Column(Text, nullable=True)  # JSON classification data
+
     # Relationships
     tool_runs = relationship("ToolRun", back_populates="scan", cascade="all, delete-orphan")
     findings = relationship("Finding", back_populates="scan", cascade="all, delete-orphan")

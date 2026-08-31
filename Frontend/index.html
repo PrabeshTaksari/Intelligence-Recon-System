@@ -10,7 +10,7 @@
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
   <meta http-equiv="Pragma" content="no-cache">
   <meta http-equiv="Expires" content="0">
-  <link rel="stylesheet" href="/static/styles.css?v=1.2.0" />
+  <link rel="stylesheet" href="/static/styles.css?v=1.2.6" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script>
     (function() {
@@ -753,8 +753,10 @@
             <div class="card-header">
               <span class="card-title">Severity Trends</span>
             </div>
-            <div class="card-body card-body-chart">
-              <canvas id="targetTrendChart"></canvas>
+            <div class="card-body card-body-chart target-trend-chart-wrap">
+              <div class="target-trend-chart-inner">
+                <canvas id="targetTrendChart"></canvas>
+              </div>
             </div>
           </div>
         </div>
@@ -813,11 +815,10 @@
     <!-- Modal Footer with PDF Export -->
     <div class="modal-footer">
       <button id="closeTargetDetailModalFooterBtn" class="btn-ghost">Close</button>
-      <button id="generateTargetPdfBtn" class="btn-primary">Generate PDF Report</button>
     </div>
   </div>
 </div>
 
-<script src="/static/app.js?v=1.2.0"></script>
+<script src="/static/app.js?v=1.2.4"></script>
 </body>
 </html>

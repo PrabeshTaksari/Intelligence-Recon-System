@@ -3,7 +3,6 @@ import sys
 import os
 from pathlib import Path
 
-# Add project root to Python path
 project_root = Path(__file__).parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
@@ -12,7 +11,6 @@ from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 
-# Always load .env from project root so config is correct regardless of cwd
 load_dotenv(project_root / ".env")
 
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -23,14 +21,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
 
-
 class NoCacheStaticMiddleware(BaseHTTPMiddleware):
     """Set no-cache headers so clients always load latest UI."""
 
     async def dispatch(self, request, call_next):
         response = await call_next(request)
-        # Avoid stale frontend assets and HTML when accessed from other devices/browsers.
-        # Static JS/CSS live under /static, and index.html is served at /.
         if request.url.path.startswith("/static/") or request.url.path == "/":
             response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
             response.headers["Pragma"] = "no-cache"
@@ -74,14 +69,12 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
 
-
 app = FastAPI(
     title="Intelligence Recon System (IRS)",
     description="AI-assisted OWASP Top 10 reconnaissance platform",
     version="1.0.0",
     lifespan=lifespan,
 )
-
 
 app.add_middleware(NoCacheStaticMiddleware)
 app.add_middleware(

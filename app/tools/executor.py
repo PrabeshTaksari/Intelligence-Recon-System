@@ -9,6 +9,64 @@ from app.core.config import settings
 
 logger = get_logger(__name__)
 
+def _estimate_nuclei_timeout(
+    base_timeout: int,
+    discovered_urls: Optional[List[str]],
+    clues: Optional[Dict[str, Any]],
+    owasp_category: Optional[str] = None,
+) -> int:
+    """Scale Nuclei timeout based on URL count and OWASP category complexity.
+    
+    Different OWASP categories use different template types with varying execution times:
+    - Fast categories (A05): Header checks, misconfigurations (~milliseconds per request)
+    - Medium categories (A01, A07, A08): Access control, auth tests (~1-3s per request)
+    - Slow categories (A03, A06): Injection, CVE scanning (~3-10s+ per request)
+    """
+    # Category-specific base timeout multipliers
+    CATEGORY_TIMEOUT_MULTIPLIERS = {
+        # Fast: Security Misconfiguration
+        "A05:2021": 1.0,
+        # Medium: Access Control, Authentication, Integrity Failures, SSRF
+        "A01:2021": 1.5,
+        "A07:2021": 1.5,
+        "A08:2021": 1.5,
+        "A10:2021": 1.5,
+        # Medium-Slow: Cryptographic, Design, Logging
+        "A02:2021": 1.75,
+        "A04:2021": 1.75,
+        "A09:2021": 1.75,
+        # Slow: Injection, Vulnerable Components
+        "A03:2021": 2.0,
+        "A06:2021": 2.0,
+    }
+    
+    # Get category multiplier (default to 1.5 if unknown or not specified)
+    category_multiplier = CATEGORY_TIMEOUT_MULTIPLIERS.get(owasp_category, 1.5)
+    
+    # Apply category multiplier to base timeout
+    adjusted_timeout = int(base_timeout * category_multiplier)
+    urls = set()
+    for u in discovered_urls or []:
+        s = str(u or "").strip()
+        if s.startswith("http://") or s.startswith("https://"):
+            urls.add(s)
+    http_services = (clues or {}).get("http_services") or []
+    for u in http_services:
+        s = str(u or "").strip()
+        if s.startswith("http://") or s.startswith("https://"):
+            urls.add(s)
+
+    n = len(urls)
+    # Keep default behavior for small scans, increase only when Nuclei input grows.
+    # URL count scaling applied after category adjustment
+    if n >= 400:
+        return max(adjusted_timeout, 3000)  # 50 min
+    if n >= 200:
+        return max(adjusted_timeout, 2400)  # 40 min
+    if n >= 100:
+        return max(adjusted_timeout, 2400)  # 40 min (fixes timeouts around ~100-200 URLs)
+    return adjusted_timeout
+
 
 async def execute_tool(
     tool_name: str,
@@ -17,6 +75,7 @@ async def execute_tool(
     timeout: Optional[int] = None,
     discovered_urls: Optional[List[str]] = None,
     clues: Optional[Dict[str, Any]] = None,
+    owasp_category: Optional[str] = None,
 ) -> ToolResult:
     """Execute a single recon tool.
 
@@ -54,15 +113,29 @@ async def execute_tool(
         extra_kwargs["discovered_urls"] = discovered_urls
     if clues is not None:
         extra_kwargs["clues"] = clues
+    if owasp_category is not None:
+        extra_kwargs["owasp_category"] = owasp_category
 
     # Nuclei needs longer timeout (runs many templates)
+    # Timeout now scales based on both URL count AND OWASP category complexity
     if tool_name == "Nuclei" and timeout is None:
-        timeout = settings.NUCLEI_TIMEOUT
+        timeout = _estimate_nuclei_timeout(
+            base_timeout=settings.NUCLEI_TIMEOUT,
+            discovered_urls=discovered_urls,
+            clues=clues,
+            owasp_category=owasp_category,  # Pass category for smart timeout calculation
+        )
+        logger.info(f"SMART TIMEOUT: Calculated Nuclei timeout={timeout}s (base={settings.NUCLEI_TIMEOUT}, urls={len(discovered_urls) if discovered_urls else 0}, owasp={owasp_category})")
+    elif tool_name == "Nuclei":
+        logger.info(f"SMART TIMEOUT: Using provided timeout={timeout}s (not calculating)")
 
     # Execute tool with exception handling
     try:
         tool: BaseTool = tool_class()
         timeout_value = timeout or settings.TOOL_TIMEOUT
+        
+        if tool_name == "Nuclei":
+            logger.info(f"NUCLEI FINAL TIMEOUT: timeout_value={timeout_value}s, timeout_param={timeout}, settings.TOOL_TIMEOUT={settings.TOOL_TIMEOUT}")
 
         logger.info(f"Executing {tool_name} for scan {scan_id}, target={target}, timeout={timeout_value}s")
 

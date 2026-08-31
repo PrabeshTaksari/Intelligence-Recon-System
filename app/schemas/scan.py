@@ -1,6 +1,7 @@
 """Scan-related schemas."""
 from typing import List, Optional, Dict, Any
 from datetime import datetime
+from urllib.parse import urlparse
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -14,11 +15,29 @@ class ScanCreate(BaseModel):
     @classmethod
     def validate_target(cls, v: str) -> str:
         """Validate and sanitize target."""
-        v = v.strip().lower()
-        # Remove protocol if present
-        v = v.replace("http://", "").replace("https://", "")
-        # Remove trailing slashes
-        v = v.rstrip("/")
+        if not isinstance(v, str):
+            raise ValueError("Target must be a string")
+
+        v = v.strip()
+        if not v:
+            raise ValueError("Target cannot be empty")
+
+        if v.startswith("//"):
+            v = "http:" + v
+
+        if v.startswith(("http://", "https://")):
+            parsed = urlparse(v)
+            host = parsed.hostname
+            port = parsed.port
+            if host:
+                v = f"{host}:{port}" if port else host
+            else:
+                v = parsed.netloc or parsed.path
+
+        # Remove any remaining path/query/fragment after URL normalization.
+        v = v.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0].strip()
+        v = v.lower().rstrip("/")
+
         if not v:
             raise ValueError("Target cannot be empty")
         return v
@@ -56,6 +75,8 @@ class ScanStatus(BaseModel):
     updated_at: datetime
     completed_at: Optional[datetime] = None
     tools: List[Dict[str, Any]] = Field(default_factory=list)
+    ai_fallback_active: bool = False
+    ai_decision_error: Optional[str] = None
     
     model_config = {"from_attributes": True}
 
@@ -88,6 +109,8 @@ class AIDecisionInfo(BaseModel):
     tools_to_run: List[str] = Field(default_factory=list)
     tools_skipped: List[Dict[str, str]] = Field(default_factory=list)
     raw_response: Optional[str] = None
+    success: bool = True
+    error: Optional[str] = None
 
 
 class ScanDetailResponse(BaseModel):
