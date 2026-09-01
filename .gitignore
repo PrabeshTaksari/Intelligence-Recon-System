@@ -34,3 +34,15 @@ Thumbs.db
 # !logs/.gitkeep
 data/*.db
 data/nuclei_manual_tests/
+
+# Academic Reports
+01 Proposal/
+02 Interim Report/
+03 Main Report/
+*Report*/
+
+# Ignore Academic Reports
+01 Proposal/
+02 Interim Report/
+03 Main Report/
+
