@@ -213,12 +213,6 @@ This tool actively scans and probes network targets, which can trigger intrusion
 
 Project Documentation
 
-This repository includes the underlying academic project write-ups:
-
-01 Proposal/ — ✅ included
-02 Interim Report/ — ✅ included
-03 Main Report/ — ⏳ not yet uploaded to this repository
-docs/ — ⏳ not yet uploaded to this repository
 License
 
 No license file is currently included in this repository. Add one (e.g. MIT, Apache-2.0) if you intend for others to reuse this code.
